@@ -96,6 +96,24 @@ Classes
       :returns: An iterator which iterates over exported entries (instances of
                 :class:`~distlib.util.ExportEntry`).
 
+   .. method:: get_dependency_closure(requirements, env=None, scheme='default')
+
+      Analyse installed metadata for the runtime dependency closure of one or
+      more requirements. This only reads installed distributions: it does not
+      download distributions, install anything, or choose different versions.
+
+      Extra requirements are part of the traversal state, so dependency cycles
+      can reactivate optional dependencies. Markers are interpreted using the
+      current environment, optionally overridden by *env*.
+
+      :param requirements: The root requirements to diagnose.
+      :type requirements: str or iterable of str
+      :param env: Optional PEP 508 marker context overrides.
+      :type env: dict
+      :param scheme: The version-matching scheme.
+      :type scheme: str
+      :returns: A :class:`DependencyClosureResult`.
+
 .. class:: Distribution
 
    A class representing a distribution, typically one which hasn't been
@@ -297,8 +315,31 @@ Classes
 
    .. attribute:: missing
 
-      Dictionary mapping distributions to a list of requirements that were not
-      provided by any distribution.
+   Dictionary mapping distributions to a list of requirements that were not
+   provided by any distribution.
+
+.. class:: PackageState
+
+   A distribution included in a closure and the extras which were activated on
+   it.
+
+.. class:: DependencyIssue
+
+   A problem encountered while analysing a closure. Its ``kind`` attribute is
+   one of ``'missing'``, ``'version_mismatch'`` or ``'unknown_extra'``. The
+   ``chain`` attribute retains one root-to-requirement sequence of requirement
+   strings which explains why the problem was reached.
+
+.. class:: DependencyClosureResult
+
+   The result of a read-only closure analysis. The ``packages`` attribute is
+   the stable list of installed distributions in the closure. The ``states``
+   attribute is a list of :class:`PackageState` values. The ``edges`` attribute
+   contains stable ``(source, target, requirement, extras)`` tuples. Problems
+   are separated into the ``missing``, ``version_mismatches`` and
+   ``unknown_extras`` attributes; the combined list is available as
+   ``problems``. The raw runtime requirements of each included package are in
+   ``requirements``.
 
 Functions
 ^^^^^^^^^
@@ -316,6 +357,17 @@ Functions
 
    Recursively generate a list of distributions from *dists* that are required by
    *dist*.
+
+.. function:: dependency_closure(requirements, installed=None, env=None, scheme='default')
+
+   Analyse the runtime dependency closure of *requirements* using installed
+   metadata. If *installed* is not supplied, the normal :data:`sys.path` is
+   searched. It may also be a :class:`DistributionPath`, mapping or iterable of
+   distributions. Return a :class:`DependencyClosureResult`.
+
+.. function:: get_dependency_closure(requirements, installed=None, env=None, scheme='default')
+
+   An alias for :func:`dependency_closure`.
 
 
 The ``distlib.resources`` package

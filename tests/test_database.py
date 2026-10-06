@@ -22,11 +22,12 @@ from distlib import DistlibException
 from distlib.compat import text_type, StringIO
 from distlib.metadata import Metadata, METADATA_FILENAME, LEGACY_METADATA_FILENAME
 from distlib.database import (InstalledDistribution, EggInfoDistribution, BaseInstalledDistribution, EXPORTS_FILENAME,
-                              DistributionPath, make_graph, get_required_dists, get_dependent_dists)
+                              DistributionPath, make_graph, get_required_dists, get_dependent_dists,
+                              dependency_closure)
 from distlib.util import get_resources_dests, CSVReader, read_exports
 
 from test_util import GlobTestCaseBase
-from support import LoggingCatcher, requires_zlib, DistlibTestCase
+from support import LoggingCatcher, TempdirManager, requires_zlib, DistlibTestCase
 
 logger = logging.getLogger(__name__)
 
@@ -1020,6 +1021,126 @@ class DepGraphTestCase(LoggingCatcher, DistlibTestCase):
         self.assertTrue(repr(graph))
 
 
+class DependencyClosureTestCase(TempdirManager, unittest.TestCase):
+
+    def write_dist(self, site_packages, name, version, requires=(), extras=()):
+        distinfo = os.path.join(site_packages, '%s-%s.dist-info' % (name, version))
+        os.makedirs(distinfo)
+        lines = [
+            'Metadata-Version: 2.1',
+            'Name: %s' % name,
+            'Version: %s' % version,
+            'Summary: Test distribution',
+        ]
+        for extra in extras:
+            lines.append('Provides-Extra: %s' % extra)
+        for requirement in requires:
+            lines.append('Requires-Dist: %s' % requirement)
+        self.write_file(os.path.join(distinfo, 'METADATA'), '\n'.join(lines) + '\n')
+
+    def test_extra_activated_through_cycle_is_traversed(self):
+        site_packages = self.mkdtemp()
+        self.write_dist(site_packages, 'A', '1.0', ['B'])
+        self.write_dist(site_packages, 'B', '1.0', ['A[feature]'])
+        self.write_dist(site_packages, 'C', '1.0')
+
+        distinfo = os.path.join(site_packages, 'A-1.0.dist-info')
+        shutil.rmtree(distinfo)
+        self.write_dist(
+            site_packages, 'A', '1.0',
+            ['B', 'C; extra == "feature"'],
+            ['feature']
+        )
+
+        path = DistributionPath([site_packages])
+        result_a = dependency_closure(['A[feature]'], path)
+        result_b = dependency_closure(['B'], path)
+
+        self.assertEqual([d.name for d in result_a.packages], ['A', 'B', 'C'])
+        self.assertEqual([d.name for d in dependency_closure(['A'], path).packages], ['A', 'B', 'C'])
+        self.assertEqual([d.name for d in result_b.packages], ['A', 'B', 'C'])
+        self.assertIn('C; extra == "feature"', result_a.requirements['a'])
+
+        extras = dict((state.distribution.key, state.extras) for state in result_a.states)
+        self.assertEqual(extras['a'], set(['feature']))
+
+        c_edges = [edge for edge in result_a.edges if edge[1] == 'c']
+        self.assertEqual(len(c_edges), 1)
+        self.assertEqual(c_edges[0][3], ('feature', ))
+
+    def test_permutation_independent_closure(self):
+        site_packages = self.mkdtemp()
+        self.write_dist(site_packages, 'A', '1.0', ['B', 'D'])
+        self.write_dist(site_packages, 'B', '1.0', ['A[feature]'])
+        self.write_dist(site_packages, 'C', '1.0')
+        self.write_dist(site_packages, 'D', '1.0')
+
+        distinfo = os.path.join(site_packages, 'A-1.0.dist-info')
+        shutil.rmtree(distinfo)
+        self.write_dist(
+            site_packages, 'A', '1.0',
+            ['B', 'D', 'C; extra == "feature"'],
+            ['feature']
+        )
+        path = DistributionPath([site_packages])
+        first = dependency_closure(['A', 'D'], path)
+        second = dependency_closure(['D', 'A'], path)
+
+        def serializable(result):
+            return (
+                [(d.key, d.version) for d in result.packages],
+                [(d.key, tuple(sorted(e))) for d, e in
+                 [(state.distribution, state.extras) for state in result.states]],
+                result.edges,
+            )
+
+        self.assertEqual(serializable(first), serializable(second))
+        self.assertEqual([d.key for d in first.packages], ['a', 'b', 'c', 'd'])
+
+    def test_problems_are_classified_and_chained(self):
+        site_packages = self.mkdtemp()
+        self.write_dist(
+            site_packages, 'root', '1.0',
+            ['old (==2.0)', 'A[missing]'],
+            ['present']
+        )
+        self.write_dist(site_packages, 'old', '1.0')
+        self.write_dist(site_packages, 'A', '1.0', ['gone'])
+        path = DistributionPath([site_packages])
+
+        result = dependency_closure(['root'], path)
+
+        self.assertEqual([issue.kind for issue in result.missing], ['missing'])
+        self.assertEqual(result.missing[0].name, 'gone')
+        self.assertEqual(result.missing[0].required_by.name, 'A')
+        self.assertEqual(result.missing[0].chain[0], 'root')
+        self.assertIn('gone', result.missing[0].chain[-1])
+
+        self.assertEqual([issue.kind for issue in result.version_mismatches], ['version_mismatch'])
+        mismatch = result.version_mismatches[0]
+        self.assertEqual((mismatch.name, mismatch.required_version, mismatch.installed_version),
+                         ('old', 'old == 2.0', '1.0'))
+
+        self.assertEqual([issue.kind for issue in result.unknown_extras], ['unknown_extra'])
+        unknown = result.unknown_extras[0]
+        self.assertEqual((unknown.name, tuple(unknown.extras)), ('A', ('missing', )))
+
+    def test_markers_use_supplied_environment(self):
+        site_packages = self.mkdtemp()
+        self.write_dist(
+            site_packages, 'root', '1.0',
+            ['linux-dep; sys_platform == "linux"', 'win-dep; sys_platform == "win32"']
+        )
+        self.write_dist(site_packages, 'linux-dep', '1.0')
+        self.write_dist(site_packages, 'win-dep', '1.0')
+        path = DistributionPath([site_packages])
+
+        result = dependency_closure(['root'], path, env={'sys_platform': 'linux'})
+
+        self.assertEqual([d.name for d in result.packages], ['linux-dep', 'root'])
+        self.assertEqual(result.problems, [])
+
+
 def test_suite():
     suite = unittest.TestSuite()
     load = unittest.defaultTestLoader.loadTestsFromTestCase
@@ -1028,6 +1149,7 @@ def test_suite():
     suite.addTest(load(TestDatabase))
     suite.addTest(load(DataFilesTestCase))
     suite.addTest(load(DepGraphTestCase))
+    suite.addTest(load(DependencyClosureTestCase))
     return suite
 
 

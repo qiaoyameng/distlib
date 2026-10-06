@@ -9,6 +9,7 @@ from __future__ import unicode_literals
 
 import base64
 import codecs
+from collections import namedtuple
 import contextlib
 import hashlib
 import logging
@@ -18,14 +19,17 @@ import sys
 import zipimport
 
 from . import DistlibException, resources
-from .compat import StringIO
+from .compat import StringIO, string_types
+from .markers import interpret_parsed
 from .version import get_scheme, UnsupportedVersionError
 from .metadata import (Metadata, METADATA_FILENAME, WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME)
 from .util import (parse_requirement, cached_property, parse_name_and_version, read_exports, write_exports, CSVReader,
                    CSVWriter)
 
 __all__ = [
-    'Distribution', 'BaseInstalledDistribution', 'InstalledDistribution', 'EggInfoDistribution', 'DistributionPath'
+    'Distribution', 'BaseInstalledDistribution', 'InstalledDistribution', 'EggInfoDistribution', 'DistributionPath',
+    'DependencyClosureResult', 'DependencyIssue', 'PackageState', 'dependency_closure',
+    'get_dependency_closure',
 ]
 
 logger = logging.getLogger(__name__)
@@ -36,6 +40,47 @@ COMMANDS_FILENAME = 'pydist-commands.json'
 DIST_FILES = ('INSTALLER', METADATA_FILENAME, 'RECORD', 'REQUESTED', 'RESOURCES', EXPORTS_FILENAME, 'SHARED')
 
 DISTINFO_EXT = '.dist-info'
+
+
+PackageState = namedtuple('PackageState', ('distribution', 'extras'))
+PackageState.dist = property(lambda self: self.distribution)
+DependencyIssue = namedtuple('DependencyIssue', ('kind', 'name', 'required_by', 'requirement', 'required_version',
+                                                 'installed_version', 'extras', 'chain'))
+
+
+class DependencyClosureResult(object):
+    """
+    The result of a read-only dependency closure analysis.
+    """
+
+    def __init__(self, packages, states, edges, missing, version_mismatches, unknown_extras,
+                 requirements=None):
+        self.packages = packages
+        self.states = states
+        self.edges = edges
+        self.missing = missing
+        self.version_mismatches = version_mismatches
+        self.unknown_extras = unknown_extras
+        self.requirements = requirements if requirements is not None else {}
+
+    @property
+    def problems(self):
+        result = []
+        result.extend(self.missing)
+        result.extend(self.version_mismatches)
+        result.extend(self.unknown_extras)
+        return result
+
+    def as_dict(self):
+        return {
+            'packages': self.packages,
+            'states': self.states,
+            'edges': self.edges,
+            'missing': self.missing,
+            'version_mismatches': self.version_mismatches,
+            'unknown_extras': self.unknown_extras,
+            'requirements': self.requirements,
+        }
 
 
 class _Cache(object):
@@ -310,6 +355,25 @@ class DistributionPath(object):
                 else:
                     for v in d.values():
                         yield v
+
+    def get_distribution_map(self):
+        """
+        Return a stable, case-insensitive mapping of names to distributions.
+        """
+        dists = sorted(self.get_distributions(), key=lambda d: (d.key, d.version, d.path))
+        result = {}
+        for dist in dists:
+            result.setdefault(dist.key, dist)
+        return result
+
+    def get_dependency_closure(self, requirements, env=None, scheme='default'):
+        """
+        Return the read-only dependency closure for requirements.
+        """
+        return dependency_closure(requirements, self, env=env, scheme=scheme)
+
+    # Backward-compatible, descriptive alias.
+    analyze_dependency_closure = get_dependency_closure
 
 
 class Distribution(object):
@@ -1327,3 +1391,199 @@ def make_dist(name, version, **kwargs):
     md.version = version
     md.summary = summary or 'Placeholder for summary'
     return Distribution(md)
+
+
+def _runtime_requirements(dist):
+    """
+    Return run requirements with their PEP 508 markers intact.
+    """
+    md = dist.metadata
+    if md._legacy is not None:
+        result = list(md._legacy.get('Requires-Dist', []))
+    else:
+        result = []
+        for entry in md.run_requires or []:
+            marker = []
+            environment = entry.get('environment')
+            extra = entry.get('extra')
+            if environment:
+                marker.append('(%s)' % environment)
+            if extra is not None:
+                marker.append('extra == "%s"' % extra.replace('\\', '\\\\').replace('"', '\\"'))
+            marker = ' and '.join(marker)
+            for requirement in entry.get('requires', []):
+                if marker:
+                    requirement = '%s; %s' % (requirement, marker)
+                result.append(requirement)
+    return sorted(set(result))
+
+
+def _requirement_is_active(parsed, extras, env):
+    if parsed.marker is None:
+        return True
+    contexts = [set([''])]
+    for extra in sorted(extras):
+        contexts.append(set([extra]))
+    for marker_extras in contexts:
+        context = dict(env or {})
+        context['extra'] = next(iter(marker_extras))
+        try:
+            if interpret_parsed(parsed.marker, context):
+                return True
+        except SyntaxError:
+            return False
+    return False
+
+
+def _installed_distribution_map(installed):
+    if installed is None:
+        installed = DistributionPath()
+    if hasattr(installed, 'get_distribution_map'):
+        return installed.get_distribution_map()
+    if isinstance(installed, dict):
+        dists = installed.values()
+    else:
+        dists = installed
+    result = {}
+    for dist in sorted(dists, key=lambda d: (d.key, d.version, getattr(d, 'path', ''))):
+        result.setdefault(dist.key, dist)
+    return result
+
+
+def _normalize_requirements(requirements):
+    if isinstance(requirements, string_types):
+        requirements = [requirements]
+    result = []
+    for requirement in requirements:
+        parsed = parse_requirement(requirement)
+        if parsed is not None:
+            result.append((str(requirement), parsed))
+    return sorted(result, key=lambda item: (item[1].name.lower(), item[1].requirement, item[0]))
+
+
+def _make_matcher(scheme, parsed):
+    try:
+        return scheme.matcher(parsed.requirement)
+    except (UnsupportedVersionError, ValueError):
+        return None
+
+
+def dependency_closure(requirements, installed=None, env=None, scheme='default'):
+    """
+    Analyse installed metadata without downloading or choosing versions.
+
+    Requirement extras are included in the traversal state. Revisiting a
+    distribution is therefore allowed when a path through a dependency cycle
+    activates additional extras.
+    """
+    scheme = get_scheme(scheme)
+    dists_by_name = _installed_distribution_map(installed)
+    states = {}
+    queue = {}
+    packages = set()
+    edges = set()
+    issues = {}
+
+    def add_issue(kind, name, required_by, requirement, required_version, installed_version,
+                  extras, chain):
+        key = (kind, name.lower(), required_by.key if required_by else None, requirement,
+               tuple(sorted(extras or ())))
+        if key not in issues:
+            issues[key] = DependencyIssue(kind, name, required_by, requirement, required_version,
+                                          installed_version, frozenset(extras or ()), tuple(chain))
+
+    def request(raw, parsed, source, chain):
+        key = parsed.name.lower()
+        dist = dists_by_name.get(key)
+        if dist is None:
+            add_issue('missing', parsed.name, source, raw, parsed.requirement, None, (), chain)
+            return
+
+        packages.add(dist)
+        declared = set(dist.metadata.extras or [])
+        requested_extras = set(parsed.extras or [])
+        known_extras = requested_extras & declared
+        unknown_extras = requested_extras - declared
+        for extra in sorted(unknown_extras):
+            add_issue('unknown_extra', parsed.name, source, raw, None, dist.version,
+                      [extra], chain)
+
+        matcher = _make_matcher(scheme, parsed)
+        satisfied = False
+        if matcher is not None:
+            try:
+                satisfied = matcher.match(dist.version)
+            except (UnsupportedVersionError, ValueError):
+                satisfied = False
+        if not satisfied:
+            add_issue('version_mismatch', parsed.name, source, raw, parsed.requirement,
+                      dist.version, known_extras, chain)
+
+        state = states.get(key)
+        path_extras = frozenset(known_extras)
+        if state is None:
+            state = {
+                'distribution': dist,
+                'extras': set(),
+                'paths': {},
+                'pending': [],
+                'new': True,
+            }
+            states[key] = state
+        is_new = state.get('new', False)
+        old_extras = set(state['extras'])
+        if path_extras not in state['paths']:
+            state['paths'][path_extras] = tuple(chain)
+            state['pending'].append(path_extras)
+        state['extras'].update(known_extras)
+        if state['pending'] and (is_new or key not in queue or state['extras'] != old_extras):
+            state['new'] = False
+            queue[key] = True
+
+    for raw, parsed in _normalize_requirements(requirements):
+        if _requirement_is_active(parsed, set(), env):
+            request(raw, parsed, None, [raw])
+
+    while queue:
+        key = sorted(queue).pop(0)
+        del queue[key]
+        state = states[key]
+        state['new'] = False
+        dist = state['distribution']
+        pending = state['pending']
+        state['pending'] = []
+        ordered_paths = sorted(
+            [(path_extras, state['paths'][path_extras]) for path_extras in pending],
+            key=lambda item: item[1]
+        )
+        for active_extras, parent_chain in ordered_paths:
+            for raw in _runtime_requirements(dist):
+                parsed = parse_requirement(raw)
+                if parsed is None or not _requirement_is_active(parsed, active_extras, env):
+                    continue
+                target_key = parsed.name.lower()
+                target = dists_by_name.get(target_key)
+                if target is not None:
+                    edges.add((key, target_key, parsed.requirement, tuple(sorted(active_extras))))
+                chain = list(parent_chain) + [raw]
+                request(raw, parsed, dist, chain)
+
+    package_list = sorted(packages, key=lambda d: (d.key, d.version, getattr(d, 'path', '')))
+    state_list = [
+        PackageState(states[key]['distribution'], frozenset(states[key]['extras']))
+        for key in sorted(states)
+    ]
+    edge_list = sorted(edges)
+    issue_list = [issues[key] for key in sorted(issues)]
+    missing = [issue for issue in issue_list if issue.kind == 'missing']
+    version_mismatches = [issue for issue in issue_list if issue.kind == 'version_mismatch']
+    unknown_extra_issues = [issue for issue in issue_list if issue.kind == 'unknown_extra']
+    raw_requirements = dict(
+        (dist.key, _runtime_requirements(dist))
+        for dist in package_list
+    )
+    return DependencyClosureResult(package_list, state_list, edge_list, missing,
+                                   version_mismatches, unknown_extra_issues, raw_requirements)
+
+
+get_dependency_closure = dependency_closure
