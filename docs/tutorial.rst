@@ -276,6 +276,9 @@ allow you to analyse the relationships between a set of distributions:
 * :func:`~distlib.database.get_required_dists`, which takes a list of distributions and
   a specific distribution in that list, and returns the distributions that
   are required by that specific distribution.
+* :func:`~distlib.database.get_dependency_closure`, which analyses the runtime
+  dependencies installed for one or more requirements without downloading
+  anything or solving versions.
 
 The graph returned by :func:`~distlib.database.make_graph` is an instance of
 :class:`DependencyGraph`.

@@ -6,6 +6,12 @@ Change log for ``distlib``
 
 Released: Not yet.
 
+- database
+
+    - Add read-only installed dependency closure analysis with environment marker
+      evaluation, extra-aware cycle traversal and separate missing, version mismatch
+      and unknown extra reports.
+
 0.4.3
 ~~~~~
 

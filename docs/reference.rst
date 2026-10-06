@@ -317,6 +317,23 @@ Functions
    Recursively generate a list of distributions from *dists* that are required by
    *dist*.
 
+.. class:: DependencyClosureResult
+
+   The result of a read-only analysis of installed runtime dependencies. The
+   matched distributions are available in :attr:`closure`, while the active
+   extras for each distribution are available in :attr:`extras`. One root-to-
+   dependency explanation path is retained for each distribution in
+   :attr:`paths`. Problems are separately available in :attr:`missing`,
+   :attr:`version_mismatches` and :attr:`unknown_extras`.
+
+.. function:: get_dependency_closure(dists, requirements, extras=None, env=None, scheme='default')
+
+   Analyse installed runtime dependencies without downloading distributions or
+   solving versions. Markers are interpreted in *env*, and installed versions
+   are checked against the requirements. Extra requests are tracked per
+   distribution, so dependency cycles which activate additional extras are
+   traversed again.
+
 
 The ``distlib.resources`` package
 ---------------------------------

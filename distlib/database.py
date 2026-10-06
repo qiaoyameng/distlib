@@ -18,14 +18,16 @@ import sys
 import zipimport
 
 from . import DistlibException, resources
-from .compat import StringIO
+from .compat import StringIO, string_types
 from .version import get_scheme, UnsupportedVersionError
 from .metadata import (Metadata, METADATA_FILENAME, WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME)
+from .markers import interpret_parsed, DEFAULT_CONTEXT
 from .util import (parse_requirement, cached_property, parse_name_and_version, read_exports, write_exports, CSVReader,
-                   CSVWriter)
+                   CSVWriter, parse_marker)
 
 __all__ = [
-    'Distribution', 'BaseInstalledDistribution', 'InstalledDistribution', 'EggInfoDistribution', 'DistributionPath'
+    'Distribution', 'BaseInstalledDistribution', 'InstalledDistribution', 'EggInfoDistribution', 'DistributionPath',
+    'DependencyClosureResult', 'DependencyClosureIssue', 'get_dependency_closure'
 ]
 
 logger = logging.getLogger(__name__)
@@ -310,6 +312,13 @@ class DistributionPath(object):
                 else:
                     for v in d.values():
                         yield v
+
+    def get_dependency_closure(self, requirements, extras=None, env=None, scheme='default'):
+        """
+        Analyse the runtime dependency closure of installed distributions.
+        """
+        dists = list(self.get_distributions())
+        return get_dependency_closure(dists, requirements, extras=extras, env=env, scheme=scheme)
 
 
 class Distribution(object):
@@ -1208,6 +1217,355 @@ class DependencyGraph(object):
         for dist, adjs in self.adjacency_list.items():
             output.append(self.repr_node(dist))
         return '\n'.join(output)
+
+
+class DependencyClosureIssue(object):
+    """
+    A problem found while analysing an installed dependency closure.
+    """
+
+    MISSING = 'missing'
+    VERSION_MISMATCH = 'version_mismatch'
+    UNKNOWN_EXTRA = 'unknown_extra'
+
+    __slots__ = ('kind', 'name', 'extra', 'requirement', 'distribution', 'source', 'path')
+
+    def __init__(self, kind, name, requirement, distribution=None, source=None,
+                 extra=None, path=()):
+        self.kind = kind
+        self.name = name
+        self.requirement = requirement
+        self.distribution = distribution
+        self.source = source
+        self.extra = extra
+        self.path = tuple(path)
+
+    @property
+    def installed_version(self):
+        return self.distribution.version if self.distribution is not None else None
+
+    def __repr__(self):
+        return '<DependencyClosureIssue %s %r %r>' % (self.kind, self.name, self.requirement)
+
+
+class DependencyClosureResult(object):
+    """
+    The result of a read-only installed dependency closure analysis.
+    """
+
+    def __init__(self):
+        self.closure = set()
+        self.roots = set()
+        self.states = {}
+        self.visited_states = set()
+        self.extras = {}
+        self.paths = {}
+        self.activation_paths = {}
+        self.issues = []
+        self.missing = {}
+        self.version_mismatches = {}
+        self.unknown_extras = {}
+
+    @property
+    def required(self):
+        return self.closure - self.roots
+
+
+def _marker_variables(expr, result):
+    if isinstance(expr, dict):
+        _marker_variables(expr.get('lhs'), result)
+        _marker_variables(expr.get('rhs'), result)
+    elif isinstance(expr, string_types) and expr and expr[0] not in '\'"':
+        result.add(expr)
+
+
+def _marker_literal(expr):
+    if isinstance(expr, string_types) and expr and expr[0] in '\'"':
+        return expr[1:-1].lower()
+    return None
+
+
+def _marker_extra_matches(expr, extras):
+    extras = set(extra.lower() for extra in extras)
+    if not isinstance(expr, dict) or expr.get('op') != '==':
+        return None
+    lhs = expr.get('lhs')
+    rhs = expr.get('rhs')
+    if lhs == 'extra':
+        value = _marker_literal(rhs)
+    elif rhs == 'extra':
+        value = _marker_literal(lhs)
+    else:
+        return None
+    if value is None:
+        return None
+    return value in extras
+
+
+def _marker_matches(marker, extras, env):
+    if marker is None:
+        return True
+    extra_match = _marker_extra_matches(marker, extras)
+    if extra_match is not None:
+        return extra_match
+    variables = set()
+    _marker_variables(marker, variables)
+    context = dict(DEFAULT_CONTEXT)
+    if env:
+        context.update(env)
+    if 'extra' not in variables:
+        return interpret_parsed(marker, context)
+    for extra in sorted(extras):
+        context['extra'] = extra
+        if interpret_parsed(marker, context):
+            return True
+    return False
+
+
+def _entry_matches(environment, extra, parsed, extras, env):
+    context = dict(DEFAULT_CONTEXT)
+    if env:
+        context.update(env)
+    if environment is not None and not interpret_parsed(environment, context):
+        return False
+    if extra is not None and extra not in extras:
+        return False
+    return _marker_matches(parsed.marker, extras, env)
+
+
+def _format_requirement_label(parsed, extras=None, marker_text=None):
+    result = parsed.name
+    if extras:
+        result += '[%s]' % ','.join(sorted(extras))
+    if parsed.constraints:
+        result += ' %s' % parsed.requirement[len(parsed.name):].lstrip()
+    if marker_text:
+        result += '; %s' % marker_text
+    return result
+
+
+def _run_requirement_entries(dist, extras):
+    result = []
+    for entry in dist.metadata.run_requires or []:
+        if isinstance(entry, dict):
+            extra = entry.get('extra')
+            environment = entry.get('environment')
+            environment_marker = None
+            if environment:
+                environment_marker, rest = parse_marker(environment)
+                if rest:
+                    raise SyntaxError('unexpected trailing data in marker: %s' % environment)
+            for raw in entry.get('requires', []):
+                parsed = parse_requirement(raw)
+                marker = parsed.marker
+                marker_parts = []
+                if environment:
+                    marker_parts.append('(%s)' % environment)
+                if ';' in raw:
+                    marker_parts.append('(%s)' % raw.split(';', 1)[1].strip())
+                if marker is not None and environment_marker is not None:
+                    marker = {'op': 'and', 'lhs': environment_marker, 'rhs': marker}
+                elif environment_marker is not None:
+                    marker = environment_marker
+                label = _format_requirement_label(parsed, parsed.extras, ' and '.join(marker_parts) or None)
+                result.append((label, parsed, marker, environment_marker, extra))
+        else:
+            parsed = parse_requirement(entry)
+            marker_text = entry.split(';', 1)[1].strip() if ';' in entry else None
+            label = _format_requirement_label(parsed, parsed.extras, marker_text)
+            result.append((label, parsed, parsed.marker, None, None))
+    result.sort(key=lambda entry: entry[0].lower())
+    return result
+
+
+def get_dependency_closure(dists, requirements, extras=None, env=None, scheme='default'):
+    """
+    Return the read-only runtime dependency closure installed in *dists*.
+
+    No distributions are downloaded and no version solving is performed. Marker
+    expressions are interpreted in *env* (or the current environment), and the
+    installed versions are checked against the requirements' constraints.
+    """
+    version_scheme = get_scheme(scheme)
+    provided = {}
+    for dist in dists:
+        provided.setdefault(dist.key, []).append(dist)
+    for candidates in provided.values():
+        candidates.sort(key=lambda d: (d.version, d.path, d.name))
+
+    if isinstance(requirements, string_types):
+        requirements = [requirements]
+    root_extras = set(extras or [])
+    roots = []
+    for requirement in requirements:
+        if hasattr(requirement, 'key') and hasattr(requirement, 'run_requires'):
+            requirement = requirement.name
+        parsed = parse_requirement(requirement)
+        req_extras = set(parsed.extras or []) | root_extras
+        marker_text = requirement.split(';', 1)[1].strip() if ';' in requirement else None
+        label = _format_requirement_label(parsed, req_extras, marker_text)
+        if not _marker_matches(parsed.marker, req_extras, env):
+            continue
+        roots.append((label.lower(), label, parsed, req_extras))
+    roots.sort(key=lambda entry: entry[0])
+
+    closure_result = DependencyClosureResult()
+    issue_keys = set()
+    states = {}
+    queued = {}
+    processed = {}
+    pending = []
+
+    def add_issue(issue):
+        key = (issue.kind, issue.name.lower(), issue.extra, issue.requirement)
+        if key not in issue_keys:
+            issue_keys.add(key)
+            closure_result.issues.append(issue)
+        else:
+            existing = next(item for item in closure_result.issues
+                            if (item.kind, item.name.lower(), item.extra, item.requirement) == key)
+            if (len(issue.path), issue.path) < (len(existing.path), existing.path):
+                existing.path = issue.path
+                existing.source = issue.source
+                existing.distribution = issue.distribution
+        return issue
+
+    def update_path(dist, path, active_extras=None):
+        path = tuple(path)
+        key = (dist, frozenset(active_extras or ()))
+        old_path = closure_result.activation_paths.get(key)
+        if old_path is None or (len(path), path) < (len(old_path), old_path):
+            closure_result.activation_paths[key] = path
+        shortest = closure_result.paths.get(dist)
+        if shortest is None or (len(path), path) < (len(shortest), shortest):
+            closure_result.paths[dist] = path
+
+    def cycle_aware_path(dist, key, path):
+        result = tuple(path)
+        for index in range(len(result) - 1, -1, -1):
+            step = result[index]
+            step_name = step.split('[', 1)[0].split(';', 1)[0].split(None, 1)[0]
+            if step_name.lower() == key:
+                return result[index:]
+        return result
+
+    def enqueue(dist, active_extras, path, added_extras=None):
+        state = states.setdefault(dist, set())
+        active_extras = set(active_extras)
+        added_extras = set(added_extras if added_extras is not None else active_extras)
+        queued_for_dist = queued.setdefault(dist, set())
+        processed_for_dist = processed.setdefault(dist, set())
+        combined = state | active_extras
+        snapshot = frozenset(combined)
+        if any(previous >= snapshot for previous in processed_for_dist | queued_for_dist):
+            return
+        state |= active_extras
+        for previous in list(queued_for_dist):
+            if previous <= snapshot:
+                queued_for_dist.remove(previous)
+        update_path(dist, path, added_extras)
+        queued_for_dist.add(snapshot)
+        pending.append((dist, snapshot))
+
+    def resolve(parsed, source, path, active_extras=None):
+        candidates = provided.get(parsed.name.lower(), [])
+        label = path[-1] if path else parsed.requirement
+        if not candidates:
+            add_issue(DependencyClosureIssue(
+                DependencyClosureIssue.MISSING, parsed.name, parsed.requirement,
+                source=source, path=path))
+            return None, set()
+
+        matcher = None
+        if parsed.constraints:
+            try:
+                matcher = version_scheme.matcher(parsed.requirement)
+            except UnsupportedVersionError:
+                logger.warning('could not read version %r - using name only', label)
+                matcher = version_scheme.matcher(parsed.name)
+
+        matched = None
+        if matcher is not None:
+            for candidate in candidates:
+                try:
+                    if matcher.match(candidate.version):
+                        matched = candidate
+                        break
+                except UnsupportedVersionError:
+                    pass
+        else:
+            matched = candidates[0]
+
+        if matched is None:
+            add_issue(DependencyClosureIssue(
+                DependencyClosureIssue.VERSION_MISMATCH, parsed.name, parsed.requirement,
+                distribution=candidates[0], source=source, path=path))
+            matched = candidates[0]
+
+        known_extras = set(matched.metadata.extras or [])
+        requested_extras = set(active_extras if active_extras is not None else (parsed.extras or []))
+        for extra in sorted(requested_extras - known_extras):
+            add_issue(DependencyClosureIssue(
+                DependencyClosureIssue.UNKNOWN_EXTRA, parsed.name, parsed.requirement,
+                distribution=matched, source=source, extra=extra, path=path))
+        return matched, requested_extras & known_extras
+
+    for _, label, parsed, req_extras in roots:
+        path = (label,)
+        target, known_extras = resolve(parsed, None, path, req_extras)
+        if target is None:
+            continue
+        closure_result.closure.add(target)
+        closure_result.roots.add(target)
+        enqueue(target, known_extras, path, known_extras)
+
+    while pending:
+        pending.sort(key=lambda item: (item[0].key, item[1]))
+        dist, snapshot = pending.pop(0)
+        queued.get(dist, set()).discard(snapshot)
+        if any(previous >= snapshot for previous in processed.setdefault(dist, set())):
+            continue
+        processed.setdefault(dist, set()).add(snapshot)
+        active_extras = set(snapshot)
+        closure_result.visited_states.add((dist, snapshot))
+
+        source_path = closure_result.activation_paths.get((dist, frozenset(active_extras)),
+                                                           closure_result.paths.get(dist, ()))
+        for label, parsed, marker, environment_marker, extra in _run_requirement_entries(dist, active_extras):
+            if not _entry_matches(environment_marker, extra, parsed, active_extras, env):
+                continue
+            path = source_path + (label,)
+            target, known_extras = resolve(parsed, dist, path)
+            if target is None:
+                continue
+            closure_result.closure.add(target)
+            activation_path = cycle_aware_path(target, parsed.name.lower(), path[:-1]) + (label,)
+            enqueue(target, known_extras, activation_path, known_extras)
+
+    for dist, state in states.items():
+        closure_result.states[dist] = {
+            'extras': set(state),
+            'path': closure_result.activation_paths.get((dist, frozenset(state)),
+                                                         closure_result.paths.get(dist, ())),
+        }
+        closure_result.extras[dist] = set(state)
+
+    for issue in closure_result.issues:
+        mapping = {
+            DependencyClosureIssue.MISSING: closure_result.missing,
+            DependencyClosureIssue.VERSION_MISMATCH: closure_result.version_mismatches,
+            DependencyClosureIssue.UNKNOWN_EXTRA: closure_result.unknown_extras,
+        }[issue.kind]
+        mapping.setdefault(issue.source, []).append(issue)
+    closure_result.issues.sort(key=lambda i: (i.kind, i.name.lower(), i.extra or '',
+                                              i.requirement, i.path))
+    for issues in closure_result.missing.values():
+        issues.sort(key=lambda i: (i.name.lower(), i.requirement, i.path))
+    for issues in closure_result.version_mismatches.values():
+        issues.sort(key=lambda i: (i.name.lower(), i.requirement, i.path))
+    for issues in closure_result.unknown_extras.values():
+        issues.sort(key=lambda i: (i.name.lower(), i.extra, i.requirement, i.path))
+    return closure_result
 
 
 def make_graph(dists, scheme='default'):

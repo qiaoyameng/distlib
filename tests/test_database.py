@@ -7,6 +7,7 @@ from __future__ import unicode_literals
 
 import base64
 import io
+import json
 import os
 import hashlib
 import logging
@@ -22,7 +23,8 @@ from distlib import DistlibException
 from distlib.compat import text_type, StringIO
 from distlib.metadata import Metadata, METADATA_FILENAME, LEGACY_METADATA_FILENAME
 from distlib.database import (InstalledDistribution, EggInfoDistribution, BaseInstalledDistribution, EXPORTS_FILENAME,
-                              DistributionPath, make_graph, get_required_dists, get_dependent_dists)
+                              DistributionPath, DependencyClosureIssue, make_graph, get_dependency_closure,
+                              get_required_dists, get_dependent_dists)
 from distlib.util import get_resources_dests, CSVReader, read_exports
 
 from test_util import GlobTestCaseBase
@@ -778,6 +780,7 @@ class DepGraphTestCase(LoggingCatcher, DistlibTestCase):
             dists.append(dist)
         return dists
 
+
     def test_make_graph(self):
         dists = self.get_dists(self.DISTROS_DIST)
 
@@ -1020,6 +1023,101 @@ class DepGraphTestCase(LoggingCatcher, DistlibTestCase):
         self.assertTrue(repr(graph))
 
 
+class DependencyClosureTestCase(DistlibTestCase):
+
+    def make_installed_dist(self, site_packages, name, version, requires_dist=(), provides_extra=()):
+        dist_info = os.path.join(site_packages, DistributionPath.distinfo_dirname(name, version))
+        os.mkdir(dist_info)
+        lines = ['Metadata-Version: 2.1', 'Name: %s' % name, 'Version: %s' % version]
+        lines.extend('Provides-Extra: %s' % extra for extra in provides_extra)
+        lines.extend('Requires-Dist: %s' % requirement for requirement in requires_dist)
+        with open(os.path.join(dist_info, METADATA_FILENAME), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        open(os.path.join(dist_info, 'RECORD'), 'w').close()
+
+    def test_extra_activated_through_cycle(self):
+        site_packages = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, site_packages)
+        self.make_installed_dist(site_packages, 'A', '1.0',
+                                 ('B', 'C; extra == "feature"'), ('feature',))
+        self.make_installed_dist(site_packages, 'B', '1.0', ('A[feature]',))
+        self.make_installed_dist(site_packages, 'C', '1.0')
+
+        states = []
+        for reverse in (False, True):
+            dists = sorted(DistributionPath([site_packages]).get_distributions(),
+                           key=lambda d: d.name, reverse=reverse)
+            result = get_dependency_closure(dists, 'A')
+            self.assertEqual(sorted(d.name for d in result.closure), ['A', 'B', 'C'])
+            a = next(d for d in result.closure if d.name == 'A')
+            c = next(d for d in result.closure if d.name == 'C')
+            self.assertEqual(result.extras[a], {'feature'})
+            self.assertEqual(result.paths[c],
+                             ('A', 'B', 'A[feature]', 'C; extra == "feature"'))
+            self.assertEqual(result.issues, [])
+            states.append(sorted((d.name, tuple(sorted(result.extras[d])))
+                                 for d in result.closure))
+        self.assertEqual(states[0], states[1])
+
+    def test_markers_and_issues(self):
+        site_packages = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, site_packages)
+        self.make_installed_dist(site_packages, 'root', '1.0', (
+            'present>=2.0',
+            'conditional; sys_platform == "linux"',
+            'skipped; sys_platform == "never"',
+            'extra-pkg[unknown]',
+        ))
+        self.make_installed_dist(site_packages, 'present', '1.0')
+        self.make_installed_dist(site_packages, 'extra-pkg', '1.0')
+
+        result = get_dependency_closure(
+            list(DistributionPath([site_packages]).get_distributions()),
+            'root', env={'sys_platform': 'linux'})
+
+        names = sorted(d.name for d in result.closure)
+        self.assertEqual(names, ['extra-pkg', 'present', 'root'])
+        kinds = {}
+        for issue in result.issues:
+            kinds.setdefault(issue.kind, []).append(issue)
+        self.assertEqual([i.name for i in kinds[DependencyClosureIssue.MISSING]], ['conditional'])
+        mismatch = kinds[DependencyClosureIssue.VERSION_MISMATCH][0]
+        self.assertEqual((mismatch.name, mismatch.installed_version), ('present', '1.0'))
+        unknown = kinds[DependencyClosureIssue.UNKNOWN_EXTRA][0]
+        self.assertEqual((unknown.name, unknown.extra), ('extra-pkg', 'unknown'))
+        self.assertEqual(unknown.path[0], 'root')
+
+    def test_structured_metadata_markers_and_extras(self):
+        site_packages = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, site_packages)
+        for name, run_requires, extras in (
+            ('root', [
+                {'environment': 'sys_platform == "linux"', 'requires': ['always']},
+                {'environment': 'sys_platform == "never"', 'requires': ['ignored-env']},
+                {'extra': 'opt', 'environment': 'sys_platform == "linux"', 'requires': ['chosen']},
+                {'extra': 'opt', 'environment': 'sys_platform == "never"', 'requires': ['ignored-opt']},
+            ], ['opt']),
+            ('always', [], []),
+            ('chosen', [], []),
+        ):
+            dist_info = os.path.join(site_packages, DistributionPath.distinfo_dirname(name, '1.0'))
+            os.mkdir(dist_info)
+            with open(os.path.join(dist_info, 'pydist.json'), 'w') as f:
+                json.dump({
+                    'metadata_version': '2.0',
+                    'name': name,
+                    'version': '1.0',
+                    'run_requires': run_requires,
+                    'extras': extras,
+                }, f)
+            open(os.path.join(dist_info, 'RECORD'), 'w').close()
+
+        result = get_dependency_closure(
+            list(DistributionPath([site_packages]).get_distributions()),
+            'root', extras=['opt'], env={'sys_platform': 'linux'})
+        self.assertEqual(sorted(d.name for d in result.closure), ['always', 'chosen', 'root'])
+
+
 def test_suite():
     suite = unittest.TestSuite()
     load = unittest.defaultTestLoader.loadTestsFromTestCase
@@ -1028,6 +1126,7 @@ def test_suite():
     suite.addTest(load(TestDatabase))
     suite.addTest(load(DataFilesTestCase))
     suite.addTest(load(DepGraphTestCase))
+    suite.addTest(load(DependencyClosureTestCase))
     return suite
 
 
