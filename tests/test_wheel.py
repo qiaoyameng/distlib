@@ -583,9 +583,10 @@ class WheelTestCase(DistlibTestCase):
                 expected = fsencode(get_executable())
             else:
                 expected = executable.encode('utf-8')
-            expected = b'#!' + expected + b' -E'
-            if not sysconfig.is_python_build():
-                self.assertIn(expected, data)
+            # The interpreter (and its -E argument) appear verbatim either on
+            # a direct shebang line or on the polyglot trampoline's exec line.
+            self.assertIn(expected, data)
+            self.assertIn(b' -E', data)
 
     def test_verify(self):
         fn = os.path.join(HERE, 'dummy-0.1-py27-none-any.whl')

@@ -6,12 +6,14 @@
 #
 from __future__ import unicode_literals
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
+import warnings
 try:
     import venv
 except ImportError:
@@ -22,7 +24,7 @@ from support import DistlibTestCase
 
 from distlib import DistlibException
 from distlib.compat import fsencode, sysconfig
-from distlib.scripts import ScriptMaker, enquote_executable
+from distlib.scripts import ScriptMaker, enquote_executable, _quote_shell_word
 from distlib.util import get_executable
 
 HERE = os.path.abspath(os.path.dirname(__file__))
@@ -56,8 +58,12 @@ class ScriptTestCase(DistlibTestCase):
             self.assertEqual(d, self.maker.target_dir)
             if fn.endswith('.py') and fn != 'foo.py':  # no shebang in foo.py
                 with open(files[0], 'rb') as f:
-                    first_line = f.readline()
-                self.assertIn(executable, first_line)
+                    header = f.readline()
+                    if header.startswith(b'#!/bin/sh\n'):
+                        # Long or space-containing path uses the polyglot
+                        # trampoline; the interpreter appears on line two.
+                        header += f.readline()
+                self.assertIn(executable, header)
 
     def test_shebangs_custom_executable(self):
         srcdir = tempfile.mkdtemp(prefix='distlib-test-')
@@ -94,8 +100,9 @@ class ScriptTestCase(DistlibTestCase):
             second_line = f.readline()
             third_line = f.readline()
         self.assertEqual(first_line, b'#!/bin/sh\n')
-        self.assertEqual(second_line, b"'''exec' an executable with "
-                         b'spaces "$0" "$@"\n')
+        # The path with spaces is quoted as data.
+        self.assertEqual(second_line, b"'''exec' 'an executable with spaces' "
+                         b'"$0" "$@"\n')
         self.assertEqual(third_line, b"' '''\n")
         # Python 3.3 cannot create a venv in an existing directory
         if venv and sys.version_info[:2] >= (3, 4):
@@ -356,6 +363,99 @@ class ScriptTestCase(DistlibTestCase):
             self.assertEqual(p.returncode, 1)
 
     @unittest.skipUnless(os.name == 'posix', 'Test only valid for POSIX')
+    def test_shebang_execution_with_probe(self):
+        # End-to-end check: generated entry scripts are actually executed with
+        # an interpreter living at a path containing spaces and quotes, and the
+        # argv seen by the interpreter matches the requested sequence -- for
+        # both the direct shebang and the POSIX trampoline (long path, spaces,
+        # multiple or empty arguments).
+        workdir = tempfile.mkdtemp(prefix='distlib-test-')
+        self.addCleanup(shutil.rmtree, workdir)
+
+        # A tiny "interpreter" which prints the argv it received as a single
+        # JSON array (like a real interpreter, it is invoked with its own
+        # arguments first, then the script path and the script's arguments).
+        runner = os.path.join(workdir, 'runner.sh')
+        runner_body = (
+            '#!/bin/sh\n'
+            "exec %s -c 'import sys, json; print(json.dumps(sys.argv[1:]))' \"$@\"\n"
+            % os.path.realpath(sys.executable))
+        with open(runner, 'w') as f:
+            f.write(runner_body)
+        os.chmod(runner, 0o755)
+
+        def make_script(interpreter, args, name):
+            target = os.path.join(workdir, 'bin')
+            if not os.path.isdir(target):
+                os.makedirs(target)
+            maker = ScriptMaker(workdir, target, add_launchers=False)
+            maker.variants = set([''])
+            maker.clobber = True
+            maker.executable = interpreter
+            spec = '%s = json:loads' % name
+            options = {'interpreter_args': args} if args is not None else None
+            return maker.make(spec, options=options)[0]
+
+        def run(path, *own_args):
+            p = subprocess.Popen([path] + list(own_args),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            self.assertEqual(p.returncode, 0, stderr)
+            self.assertEqual(stderr, b'', stderr)
+            return json.loads(stdout.decode())
+
+        # 1. Short, safe path -> direct shebang; one argument.
+        direct_interp = os.path.join(workdir, 'python-probe')
+        os.symlink(runner, direct_interp)
+        direct_script = make_script(direct_interp, ['-B'], 'direct_cmd')
+        with open(direct_script, 'rb') as f:
+            self.assertEqual(f.readline(),
+                             fsencode('#!%s -B\n' % direct_interp))
+        interp_argv = run(direct_script, 'own one', 'own$two')
+        self.assertEqual(interp_argv[:-3], ['-B'])
+        self.assertEqual(interp_argv[-2:], ['own one', 'own$two'])
+
+        # 2. Interpreter path with spaces, single and double quotes and shell
+        # metacharacters -> trampoline; all bytes treated as data.
+        weird_dir = os.path.join(workdir, "dir with 'apostrophe'")
+        os.makedirs(weird_dir)
+        weird_interp = os.path.join(weird_dir, 'int "q" $(nope) `bt` &;|*')
+        os.symlink(runner, weird_interp)
+        weird_args = ['-E', '', 'a b', "x'y", '"dq"', '$(nope)', 'back\\slash']
+        tramp_script = make_script(weird_interp, weird_args, 'tramp_cmd')
+        with open(tramp_script, 'rb') as f:
+            self.assertEqual(f.readline(), b'#!/bin/sh\n')
+        interp_argv = run(tramp_script, 'own one')
+        # The interpreter arguments come through as separate, unexpanded
+        # values (empty string preserved), followed by the script path and the
+        # script's own arguments verbatim.
+        self.assertEqual(interp_argv[:len(weird_args)], weird_args)
+        self.assertEqual(interp_argv[-2:], [tramp_script, 'own one'])
+        # The polyglot is itself valid Python.
+        with open(tramp_script, 'rb') as f:
+            compile(f.read(), tramp_script, 'exec')
+
+        # 3. Long path -> trampoline fallback, but identical argv sequence to
+        # the direct form. Empty argument also forces the trampoline.
+        long_interp = os.path.join(workdir, 'l' * 120, 'python-probe')
+        os.makedirs(os.path.dirname(long_interp))
+        os.symlink(runner, long_interp)
+        cases = ([], ['-B'], [''])  # none / one / empty
+        for args in cases:
+            long_script = make_script(long_interp, args, 'long_cmd')
+            with open(long_script, 'rb') as f:
+                self.assertEqual(f.readline(), b'#!/bin/sh\n')
+            short_script = make_script(direct_interp, args, 'short_cmd')
+            long_seen = run(long_script, 'z')
+            short_seen = run(short_script, 'z')
+            # Normalise the differing interpreter path and script name; the
+            # argument sequence (interpreter args + own script args) must be
+            # identical between the two generation methods.
+            def seq(seen, path):
+                return seen[:seen.index(path)] + ['SCRIPT'] + seen[seen.index(path) + 1:]
+            self.assertEqual(seq(long_seen, long_script), seq(short_seen, short_script))
+
+    @unittest.skipUnless(os.name == 'posix', 'Test only valid for POSIX')
     def test_mode(self):
         # save test runner's original umask and ensure default 022
         saved_umask = os.umask(0o022)
@@ -376,15 +476,46 @@ class ScriptTestCase(DistlibTestCase):
 
     def test_interpreter_args(self):
         executable = fsencode(get_executable())
-        options = {'interpreter_args': ['-E', '"foo bar"', 'baz frobozz']}
+        # Structured arguments: each element survives as one argument, with
+        # quotes/metacharacters treated as data (no user-supplied quoting).
+        options = {'interpreter_args': ['-E', 'foo bar', "ba'z", '"q"', '$(x)']}
         self.maker.variants = set([''])
         files = self.maker.make('foo = bar:baz', options=options)
         self.assertEqual(len(files), 1)
         with open(files[0], 'rb') as f:
-            shebang_line = f.readline()
+            header = f.read()
+        # More than one argument cannot be expressed by a direct shebang (a
+        # POSIX kernel passes the whole post-interpreter text as one word), so
+        # the safe trampoline must be used.
+        self.assertTrue(header.startswith(b'#!/bin/sh\n'))
+        exec_line = header.split(b'\n', 2)[1]
         if not sysconfig.is_python_build():
-            self.assertIn(executable, shebang_line)
-        self.assertIn(b' -E "foo bar" baz frobozz', shebang_line)
+            self.assertIn(executable, exec_line)
+        for token in (b"-E", b"'foo bar'", b"'ba'\"'\"'z'", b"'\"q\"'", b"'$(x)'"):
+            self.assertIn(token, exec_line)
+        # The generated polyglot must remain valid Python.
+        compile(header, 'script', 'exec')
+
+    def test_interpreter_args_instance_attribute(self):
+        # The public instance attribute follows the same rules as the option.
+        self.maker.variants = set([''])
+        self.maker.interpreter_args = ['-E', 'foo bar']
+        files = self.maker.make('foo = bar:baz')
+        with open(files[0], 'rb') as f:
+            header = f.read()
+        self.assertTrue(header.startswith(b'#!/bin/sh\n'))
+        self.assertIn(b"-E", header)
+        self.assertIn(b"'foo bar'", header)
+
+    def test_interpreter_args_legacy_string(self):
+        # A plain string value keeps the old verbatim-append behaviour.
+        self.maker.variants = set([''])
+        self.maker.executable = 'mypython'
+        files = self.maker.make('foo = bar:baz',
+                                options={'interpreter_args': '-E "foo bar"'})
+        with open(files[0], 'rb') as f:
+            shebang_line = f.readline()
+        self.assertEqual(shebang_line, b'#!mypython -E "foo bar"\n')
 
     def test_args_on_copy(self):
         self.maker.variants = set([''])
@@ -393,14 +524,17 @@ class ScriptTestCase(DistlibTestCase):
         with open(files[0]) as f:
             actual = f.readline().strip()
         self.assertEqual(actual, '#!mypython -mzippy.activate')
+        # With a long/space-containing real interpreter path the legacy args
+        # from the copied shebang appear on the trampoline's exec line.
         if not sysconfig.is_python_build():
             self.maker.executable = None
             os.remove(files[0])
             files = self.maker.make('script5.py')
-            with open(files[0]) as f:
-                actual = f.readline().strip()
-            expected = '#!%s -mzippy.activate' % get_executable()
-            self.assertEqual(actual, expected)
+            with open(files[0], 'rb') as f:
+                lines = f.read().split(b'\n', 2)
+            header = b'\n'.join(lines[:2])
+            self.assertIn(fsencode(get_executable()), header)
+            self.assertIn(b' -mzippy.activate', header)
 
     def test_enquote_executable(self):
         for executable, expected in (('/no/spaces', '/no/spaces'), ('/i have/space', '"/i have/space"'),
@@ -409,6 +543,47 @@ class ScriptTestCase(DistlibTestCase):
                                                                                           '/usr/bin/env "with spaces"'),
                                      ('/usr/bin/env "pre spaced"', '/usr/bin/env "pre spaced"')):
             self.assertEqual(enquote_executable(executable), expected)
+
+    @unittest.skipUnless(os.name == 'posix', 'Test only valid for POSIX')
+    def test_quote_shell_word(self):
+        # Every value round-trips exactly under a POSIX shell and the encoded
+        # bytes are safe to embed in the sh/Python polyglot (no run of three
+        # single quotes, no unrecognised Python backslash escape).
+        values = [
+            '', 'a', 'a b', "a'b", "a''b", "a'''b", "a''''b", "'a", "a'",
+            '"dq"', '"""', 'a"""b', '""""""', '$HOME', '$(x)', '`bt`',
+            'a;b & c | d > f', 'star* ques? bracket[x]', 'back\\slash',
+            '\\', '\\\\', "\\' \\\" \\$ \\`", 'mix "q" $(x) `t` \\ ; & |',
+            "weird 'a\"b $(d) x' y",
+        ]
+        for value in values:
+            data = value.encode('utf-8')
+            encoded = _quote_shell_word(data)
+            self.assertNotIn(b"'''", encoded)
+            # Embeddable inside the real polyglot (it spans the exec line and
+            # the closing line, where the delimiter is never adjacent to the
+            # data).
+            polyglot = (b"#!/bin/sh\n'''exec' " + encoded + b' "$0" "$@"\n'
+                        + b"' '''\nimport sys\n")
+            with warnings.catch_warnings():
+                warnings.simplefilter('error', SyntaxWarning)
+                compile(polyglot, 'x', 'exec')
+            # Shell expands it back to exactly the original bytes, whether the
+            # encoded word appears as a command-line element or in an
+            # assignment. cmp avoids the test/[ builtin's parsing quirks.
+            check = (b'f=$(mktemp); g=$(mktemp); set -- %s; '
+                     b'printf "%%s" "$1" > "$f"; x=%s; '
+                     b'printf "%%s" "$x" > "$g"; cmp "$f" "$g"\n') % (encoded, encoded)
+            with tempfile.NamedTemporaryFile(delete=False) as tf:
+                tf.write(b'#!/bin/sh\n' + check)
+                name = tf.name
+            self.addCleanup(os.remove, name)
+            os.chmod(name, 0o755)
+            p = subprocess.Popen([name], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _, stderr = p.communicate()
+            self.assertEqual(p.returncode, 0, (value, encoded, stderr))
+        # Safe bytes pass through untouched.
+        self.assertEqual(_quote_shell_word(b'/usr/bin/python3'), b'/usr/bin/python3')
 
     def test_variant_configuration(self):
         spec = 'foo = foo:main'

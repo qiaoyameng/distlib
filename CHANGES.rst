@@ -6,6 +6,19 @@ Change log for ``distlib``
 
 Released: Not yet.
 
+- scripts
+
+    - Added a public ``interpreter_args`` attribute on ``ScriptMaker`` which
+      accepts a list of interpreter arguments, each passed verbatim as a single
+      argument (spaces, quotes and shell metacharacters are treated as data).
+      A string value keeps the old verbatim-append behaviour for backwards
+      compatibility. When a direct shebang cannot express the invocation
+      exactly (long or space/quote-containing interpreter path, more than one
+      argument, or an empty argument), a safe POSIX shell trampoline is
+      generated instead; the script's own arguments are appended verbatim with
+      ``"$0" "$@"`` and ``eval`` is not used. Pre-existing wheel scripts and
+      console entry points share the same argument handling.
+
 0.4.3
 ~~~~~
 

@@ -89,6 +89,55 @@ def enquote_executable(executable):
 # Keep the old name around (for now), as there is at least one project using it!
 _enquote_executable = enquote_executable
 
+# Bytes which need no quoting in a POSIX shell word.
+_SHELL_SAFE = re.compile(br"^[A-Za-z0-9_./:@%+=,^-]+$")
+
+
+def _quote_shell_word(data):
+    """
+    Encode *data* (bytes) for a POSIX shell so that it is treated entirely as
+    data: word splitting, globbing and expansions never occur and the shell
+    expands the quoted word back to exactly *data*.
+
+    The result is additionally constrained so that it can be embedded inside a
+    Python triple-single-quoted string literal (the generated shebang is a
+    sh/Python polyglot): it contains no run of three single quotes and no
+    unrecognised Python backslash escape sequence.
+    """
+    if _SHELL_SAFE.match(data):
+        return data
+    result = bytearray()
+    i = 0
+    n = len(data)
+    while i < n:
+        ch = data[i:i + 1]
+        if ch == b"'":
+            # Collect the run of apostrophes. A bare apostrophe is safe inside
+            # a double-quoted shell word, but emit at most two per word so that
+            # no run of three single quotes appears in the result.
+            j = i
+            while j < n and data[j:j + 1] == b"'":
+                j += 1
+            run = data[i:j]
+            groups = [b'"' + run[k:k + 2] + b'"' for k in range(0, len(run), 2)]
+            # Adjacent double-quoted words concatenate with no bytes between
+            # them (an empty "" joins the groups without adding data).
+            result += b'""'.join(groups)
+            i = j
+        elif ch == b"\\":
+            # Doubling the backslash keeps it a valid (recognised) escape in
+            # the enclosing Python string literal, while a double-quoted shell
+            # word collapses it back to a single backslash.
+            result += b'"\\\\"'
+            i += 1
+        else:
+            j = i
+            while j < n and data[j:j + 1] not in (b"'", b"\\"):
+                j += 1
+            result += b"'" + data[i:j] + b"'"
+            i = j
+    return bytes(result) or b"''"
+
 
 class ScriptMaker(object):
     """
@@ -98,6 +147,11 @@ class ScriptMaker(object):
     script_template = SCRIPT_TEMPLATE
 
     executable = None  # for shebangs
+    # A sequence of arguments to pass to the interpreter in generated shebangs.
+    # Each element is passed verbatim as a single argument (spaces and shell
+    # metacharacters are handled as data). A plain string is accepted for
+    # backwards compatibility and is appended verbatim (legacy behaviour).
+    interpreter_args = None
 
     def __init__(self, source_dir, target_dir, add_launchers=True, dry_run=False, fileop=None):
         self.source_dir = source_dir
@@ -112,6 +166,32 @@ class ScriptMaker(object):
 
         self._is_nt = os.name == 'nt' or (os.name == 'java' and os._name == 'nt')
         self.version_info = sys.version_info
+
+    def _get_interpreter_args(self, options):
+        """
+        Return a ``(structured, raw)`` tuple for the interpreter arguments.
+
+        *structured* is a list of argument strings (possibly empty), while
+        *raw* is a legacy already-encoded byte string (possibly empty) appended
+        verbatim after the interpreter. The per-call *options* value takes
+        precedence over the instance-level :attr:`interpreter_args`.
+        """
+        args = None
+        if options:
+            args = options.get('interpreter_args')
+        if args is None:
+            args = self.interpreter_args
+        if args is None:
+            structured, raw = [], b''
+        elif isinstance(args, (str, bytes)):
+            # Backwards-compatible legacy behaviour: append the value verbatim.
+            if isinstance(args, bytes):
+                args = args.decode('utf-8')
+            structured, raw = [], ((' %s' % args).encode('utf-8') if args else b'')
+        else:
+            structured = [a.decode('utf-8') if isinstance(a, bytes) else a for a in args]
+            raw = b''
+        return structured, raw
 
     def _get_alternate_executable(self, executable, options):
         if options.get('gui', False) and self._is_nt:  # pragma: no cover
@@ -146,17 +226,30 @@ class ScriptMaker(object):
                 return executable
             return '/usr/bin/env %s' % executable
 
-    def _build_shebang(self, executable, post_interp):
+    def _build_shebang(self, executable, post_interp, interpreter_args=()):
         """
-        Build a shebang line. In the simple case (on Windows, or a shebang line
-        which is not too long or contains spaces) use a simple formulation for
-        the shebang. Otherwise, use /bin/sh as the executable, with a contrived
-        shebang which allows the script to run either under Python or sh, using
-        suitable quoting. Thanks to Harald Nordgren for his input.
+        Build a shebang line.
+
+        *executable* is the (already encoded) interpreter to invoke,
+        *post_interp* is a legacy, already-encoded string which is appended
+        verbatim after the interpreter (it comes from a shebang being copied or
+        a string-valued *interpreter_args* option), and *interpreter_args* is a
+        sequence of argument strings which must each be passed to the
+        interpreter as a single, unexpanded argument.
+
+        When the direct form can express the whole invocation exactly (on
+        non-POSIX, or a short path with no spaces and at most one non-empty
+        argument -- a POSIX kernel passes everything following the interpreter
+        as a single word), it is used. Otherwise a safe POSIX polyglot
+        trampoline is generated, where the interpreter path, its arguments and
+        every shell metacharacter are quoted as data. The resulting script runs
+        under /bin/sh and is also valid Python (so it can be invoked with an
+        explicit interpreter). Thanks to Harald Nordgren for his input.
 
         See also: http://www.in-ulm.de/~mascheck/various/shebang/#length
                   https://hg.mozilla.org/mozilla-central/file/tip/mach
         """
+        raw_args = [a.encode('utf-8') for a in interpreter_args]
         if os.name != 'posix':
             simple_shebang = True
         elif getattr(sys, "cross_compiling", False):
@@ -166,23 +259,52 @@ class ScriptMaker(object):
             # fail, raising "OSError 8 [Errno 8] Exec format error".
             simple_shebang = False
         else:
-            # Add 3 for '#!' prefix and newline suffix.
-            shebang_length = len(executable) + len(post_interp) + 3
+            # A POSIX kernel passes everything after the interpreter as a
+            # single word, does not interpret quoting and trims whitespace, so
+            # only zero or one non-empty argument without spaces or quotes can
+            # be expressed faithfully with a direct shebang.
+            simple_args = len(raw_args) < 2 and all(
+                a and b' ' not in a and b"'" not in a and b'"' not in a
+                for a in raw_args)
             if sys.platform == 'darwin':
                 max_shebang_length = 512
             else:
                 max_shebang_length = 127
-            simple_shebang = ((b' ' not in executable) and (shebang_length <= max_shebang_length))
+            # The direct form emits simple arguments verbatim (the kernel
+            # ignores quoting); size it using those bytes.
+            rendered_args = (b' ' + b' '.join(raw_args)) if raw_args else b''
+            # Add 3 for '#!' prefix and newline suffix.
+            shebang_length = len(executable) + len(rendered_args) + len(post_interp) + 3
+            simple_shebang = (simple_args and (b' ' not in executable)
+                              and (shebang_length <= max_shebang_length))
 
         if simple_shebang:
-            result = b'#!' + executable + post_interp + b'\n'
+            if os.name == 'posix':
+                # The kernel ignores quoting and trims whitespace, so only the
+                # simple-argument case reaches this branch: emit verbatim.
+                direct_args = raw_args
+            else:
+                # Non-POSIX launchers parse the tail as a command line.
+                direct_args = [_quote_shell_word(a) for a in raw_args]
+            rendered_args = (b' ' + b' '.join(direct_args)) if direct_args else b''
+            result = b'#!' + executable + rendered_args + post_interp + b'\n'
         else:
+            quoted_args = [_quote_shell_word(a) for a in raw_args]
+            rendered_args = (b' ' + b' '.join(quoted_args)) if quoted_args else b''
+            if executable.startswith(b'/usr/bin/env '):
+                # Legacy form emitted for Jython; keep it verbatim.
+                interpreter_word = executable
+            elif _SHELL_SAFE.match(executable):
+                interpreter_word = executable
+            else:
+                interpreter_word = _quote_shell_word(executable)
             result = b'#!/bin/sh\n'
-            result += b"'''exec' " + executable + post_interp + b' "$0" "$@"\n'
+            result += (b"'''exec' " + interpreter_word + rendered_args + post_interp
+                       + b' "$0" "$@"\n')
             result += b"' '''\n"
         return result
 
-    def _get_shebang(self, encoding, post_interp=b'', options=None):
+    def _get_shebang(self, encoding, post_interp=b'', options=None, interpreter_args=()):
         enquote = True
         if self.executable:
             executable = self.executable
@@ -227,7 +349,7 @@ class ScriptMaker(object):
         if (sys.platform == 'cli' and '-X:Frames' not in post_interp and
                 '-X:FullFrames' not in post_interp):  # pragma: no cover
             post_interp += b' -X:Frames'
-        shebang = self._build_shebang(executable, post_interp)
+        shebang = self._build_shebang(executable, post_interp, interpreter_args)
         # Python parser starts to read a script using UTF-8 until
         # it gets a #coding:xxx cookie. The shebang has to be the
         # first line of a file, the #coding:xxx cookie cannot be
@@ -328,13 +450,9 @@ class ScriptMaker(object):
         return result
 
     def _make_script(self, entry, filenames, options=None):
-        post_interp = b''
-        if options:
-            args = options.get('interpreter_args', [])
-            if args:
-                args = ' %s' % ' '.join(args)
-                post_interp = args.encode('utf-8')
-        shebang = self._get_shebang('utf-8', post_interp, options=options)
+        interpreter_args, post_interp = self._get_interpreter_args(options)
+        shebang = self._get_shebang('utf-8', post_interp, options=options,
+                                    interpreter_args=interpreter_args)
         script = self._get_script_text(entry).encode('utf-8')
         scriptnames = self.get_script_filenames(entry.name)
         if options and options.get('gui', False):

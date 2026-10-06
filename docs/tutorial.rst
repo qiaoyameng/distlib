@@ -1193,13 +1193,25 @@ The string passed to make can take one of the following forms:
   should be used. (This only applies if ``add_launchers`` is true.)
 
   ``interpreter_args``: If provided, this should be a list of strings which
-  are added to the shebang line following the interpreter. If there are values
-  with spaces, you will need to surround them with double quotes.
+  are passed to the interpreter following the interpreter path. Each value is
+  passed verbatim as a single argument -- spaces, quotes and shell
+  metacharacters are treated as data, so you should not add your own quoting.
+  You can also set the :attr:`~distlib.scripts.ScriptMaker.interpreter_args`
+  attribute on the :class:`ScriptMaker` instance. A plain string value is
+  accepted for backwards compatibility and appended verbatim (this legacy form
+  cannot preserve argument boundaries).
 
   .. note:: Use of this feature may affect portability, since POSIX does not
     standardise how these arguments are passed to the interpreter (see
     https://en.wikipedia.org/wiki/Shebang_line#Portability for more
     information).
+
+    When a direct shebang cannot represent the arguments faithfully (a long
+    interpreter path, a path with spaces or quotes, more than one argument, or
+    an empty argument on POSIX), a safe POSIX shell trampoline is generated
+    instead. It quotes the interpreter path and arguments as data and appends
+    the script's own arguments verbatim (``"$@"``), so the resulting process
+    receives exactly the same argument sequence.
 
   For example, you can pass ``{'gui': True}`` to generate a windowed script.
 
