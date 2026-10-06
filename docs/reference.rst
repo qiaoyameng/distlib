@@ -678,9 +678,18 @@ Classes
 
                           ``interpreter_args``: If specified, this should be
                           a list of strings which are appended to the
-                          interpreter executable in the shebang line. If there
-                          are values with spaces, you will need to surround
-                          them with double quotes.
+                          interpreter executable in the shebang line. Each
+                          string is one argument, passed verbatim -- spaces,
+                          quotes and shell metacharacters are treated as data,
+                          so quoting must not be added by the caller. A plain
+                          string is accepted too, for backwards compatibility,
+                          and split with POSIX shell rules. When a direct
+                          shebang cannot carry the arguments faithfully (for
+                          example a long path, a path with spaces, multiple
+                          arguments or an empty argument), a POSIX shell
+                          trampoline is used which quotes every path and
+                          argument as data. The script's own arguments are
+                          always appended verbatim.
 
                           .. note:: Linux does not handle passing arguments
                              to interpreters particularly well -- multiple

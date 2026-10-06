@@ -8,13 +8,14 @@ from io import BytesIO
 import logging
 import os
 import re
+import shlex
 import struct
 import sys
 import time
 from zipfile import ZipInfo
 
 from . import DistlibException
-from .compat import sysconfig, detect_encoding, ZipFile
+from .compat import sysconfig, detect_encoding, ZipFile, string_types
 from .resources import finder
 from .util import (FileOperator, get_export_entry, convert_path, get_executable, get_platform, in_venv,
                    is_in_directory)
@@ -49,6 +50,96 @@ if __name__ == '__main__':
     sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
     sys.exit(%(func)s())
 '''
+
+# Whitespace separating tokens in a shebang line (spaces or tabs).
+_SHEBANG_WHITESPACE_RE = re.compile(br'[ \t]+')
+# Inside double quotes, only these characters need backslash-escaping in a
+# POSIX shell. Spaces, single quotes and other punctuation stay literal.
+_SHELL_ESCAPE_CHARS_RE = re.compile(r'([$`"\\])')
+# Characters which are safe to put, unquoted, in a direct shebang line. The
+# kernel treats the whole tail of a shebang as an opaque string (on Linux it
+# is handed to the interpreter as a single argument), so anything containing
+# whitespace or quotes cannot be expressed faithfully in a direct shebang.
+_DIRECT_SHEBANG_SAFE_RE = re.compile(r'[A-Za-z0-9_@%+=:,./-]*\Z')
+# Tokens embedded in generated files must be single-line and NUL-free.
+_SHEBANG_FORBIDDEN_CHARS_RE = re.compile(r'[\x00\r\n]')
+
+
+def _normalize_interpreter_args(interpreter_args):
+    """
+    Normalize interpreter arguments into a list of strings.
+
+    A list or tuple of strings is the documented, data-safe form: each entry
+    is one argument, passed verbatim to the interpreter. A plain string is
+    also accepted for backwards compatibility and split using POSIX shell
+    rules, so that single- and double-quoted whitespace is honored.
+    """
+    if interpreter_args is None:
+        result = []
+    elif isinstance(interpreter_args, (list, tuple)):
+        result = [str(arg) for arg in interpreter_args]
+    elif isinstance(interpreter_args, string_types):
+        result = _split_shebang_tail(interpreter_args)
+    else:
+        raise TypeError('interpreter_args must be a list, tuple or string, '
+                        'not %s' % type(interpreter_args).__name__)
+    return result
+
+
+def _split_shebang_tail(data):
+    """
+    Split the portion of a shebang line following the interpreter into
+    whitespace-separated tokens, honoring single and double quotes. Returns a
+    list of strings. If the quoting is malformed, fall back to splitting on
+    bare whitespace, treating quotes as ordinary characters.
+    """
+    if isinstance(data, bytes):
+        data = data.decode('utf-8')
+    try:
+        result = shlex.split(data, posix=True)
+    except ValueError:
+        result = [part.decode('utf-8')
+                  for part in _SHEBANG_WHITESPACE_RE.split(data.encode('utf-8')) if part]
+    return result
+
+
+def _quote_shell_token(token):
+    """
+    Quote one token so that a POSIX shell recovers it exactly as data.
+
+    Double quotes are used rather than single quotes (with the characters that
+    remain special inside double quotes backslash-escaped), so that the
+    generated trampoline cannot collide with the surrounding triple
+    single-quoted Python string.
+    """
+    return '"%s"' % _SHELL_ESCAPE_CHARS_RE.sub(r'\\\1', token)
+
+
+def _quote_executable_for_shell(executable):
+    """
+    Turn an executable specification into a list of POSIX shell words,
+    quoting every word as data. This honors the ``/usr/bin/env exe`` form and
+    any pre-existing quoting, so that paths containing spaces, quotes or shell
+    metacharacters are passed to the interpreter verbatim.
+    """
+    if isinstance(executable, bytes):
+        executable = executable.decode('utf-8')
+    words = None
+    # The ``env`` form genuinely contains multiple words; anything else is a
+    # single pathname, even when it contains spaces or quotes.
+    if executable.startswith('/usr/bin/env ') or executable.startswith('/bin/env '):
+        try:
+            words = shlex.split(executable, posix=True)
+        except ValueError:  # malformed quoting
+            words = None
+    if words is None:
+        path = executable
+        # Strip a single layer of enclosing quotes if the caller pre-quoted
+        # the path (as recommended for older direct shebangs).
+        if len(path) >= 2 and path[0] == path[-1] and path[0] in ('"', "'"):
+            path = path[1:-1]
+        words = [path]
+    return [_quote_shell_token(word).encode('utf-8') for word in words]
 
 # Pre-fetch the contents of all executable wrapper stubs.
 # This is to address https://github.com/pypa/pip/issues/12666.
@@ -146,17 +237,31 @@ class ScriptMaker(object):
                 return executable
             return '/usr/bin/env %s' % executable
 
-    def _build_shebang(self, executable, post_interp):
+    def _build_shebang(self, executable, args):
         """
-        Build a shebang line. In the simple case (on Windows, or a shebang line
-        which is not too long or contains spaces) use a simple formulation for
-        the shebang. Otherwise, use /bin/sh as the executable, with a contrived
-        shebang which allows the script to run either under Python or sh, using
-        suitable quoting. Thanks to Harald Nordgren for his input.
+        Build a shebang line.
+
+        ``executable`` is the interpreter executable (bytes) and ``args`` is a
+        list of interpreter argument tokens (strings).
+
+        When the interpreter and its arguments can be expressed faithfully by a
+        direct shebang (off POSIX, or a short, space-free executable with at
+        most one simple argument), the direct form is used. Otherwise a POSIX
+        trampoline is generated: /bin/sh execs the interpreter with every path
+        and argument quoted as data, preserving token boundaries even when
+        paths contain spaces, quotes or shell metacharacters.
+
+        The trampoline is also a valid Python file: the shell-only line is a
+        triple-quoted string expression, so Python never sees it (and emits no
+        escape-sequence warnings).
 
         See also: http://www.in-ulm.de/~mascheck/various/shebang/#length
                   https://hg.mozilla.org/mozilla-central/file/tip/mach
         """
+        for token in [executable.decode('utf-8')] + list(args):
+            if _SHEBANG_FORBIDDEN_CHARS_RE.search(token):
+                raise ValueError('Shebang components must not contain '
+                                 'newlines or NUL bytes: %r' % token)
         if os.name != 'posix':
             simple_shebang = True
         elif getattr(sys, "cross_compiling", False):
@@ -166,23 +271,42 @@ class ScriptMaker(object):
             # fail, raising "OSError 8 [Errno 8] Exec format error".
             simple_shebang = False
         else:
+            post_interp = self._render_direct_args(args)
             # Add 3 for '#!' prefix and newline suffix.
             shebang_length = len(executable) + len(post_interp) + 3
             if sys.platform == 'darwin':
                 max_shebang_length = 512
             else:
                 max_shebang_length = 127
-            simple_shebang = ((b' ' not in executable) and (shebang_length <= max_shebang_length))
+            # On Linux the kernel hands the whole post-interpreter tail to the
+            # interpreter as a single argument; at most one token can be
+            # expressed faithfully there (and only if it contains no
+            # whitespace). Empty tokens cannot be expressed in a shebang at
+            # all. Anything else requires the shell trampoline.
+            simple_shebang = (b' ' not in executable and b'\t' not in executable and
+                              shebang_length <= max_shebang_length and len(args) <= 1 and
+                              all(args) and
+                              all(_DIRECT_SHEBANG_SAFE_RE.match(arg) for arg in args))
 
         if simple_shebang:
-            result = b'#!' + executable + post_interp + b'\n'
+            result = b'#!' + executable + self._render_direct_args(args) + b'\n'
         else:
+            words = _quote_executable_for_shell(executable)
+            words.extend(_quote_shell_token(arg).encode('utf-8') for arg in args)
             result = b'#!/bin/sh\n'
-            result += b"'''exec' " + executable + post_interp + b' "$0" "$@"\n'
-            result += b"' '''\n"
+            result += b"''''exec " + b' '.join(words) + b' "$0" "$@" # ' + b"'''\n"
         return result
 
-    def _get_shebang(self, encoding, post_interp=b'', options=None):
+    def _render_direct_args(self, args):
+        """
+        Render interpreter argument tokens for a direct shebang. Tokens are
+        separated by a single space, exactly as a shebang reader expects.
+        """
+        if not args:
+            return b''
+        return b' ' + b' '.join(arg.encode('utf-8') for arg in args)
+
+    def _get_shebang(self, encoding, args=None, options=None):
         enquote = True
         if self.executable:
             executable = self.executable
@@ -217,17 +341,20 @@ class ScriptMaker(object):
         # Windows as equivalent in path names.
 
         # If the user didn't specify an executable, it may be necessary to
-        # cater for executable paths with spaces (not uncommon on Windows)
-        if enquote:
+        # cater for executable paths with spaces (not uncommon on Windows).
+        # On POSIX the quoting is handled by _build_shebang itself (the direct
+        # form is used when there are no spaces, otherwise every word is
+        # quoted as data in the shell trampoline).
+        if enquote and os.name != 'posix':
             executable = enquote_executable(executable)
         # Issue #51: don't use fsencode, since we later try to
         # check that the shebang is decodable using utf-8.
         executable = executable.encode('utf-8')
+        args = _normalize_interpreter_args(args)
         # in case of IronPython, play safe and enable frames support
-        if (sys.platform == 'cli' and '-X:Frames' not in post_interp and
-                '-X:FullFrames' not in post_interp):  # pragma: no cover
-            post_interp += b' -X:Frames'
-        shebang = self._build_shebang(executable, post_interp)
+        if sys.platform == 'cli' and '-X:Frames' not in args and '-X:FullFrames' not in args:  # pragma: no cover
+            args.append('-X:Frames')
+        shebang = self._build_shebang(executable, args)
         # Python parser starts to read a script using UTF-8 until
         # it gets a #coding:xxx cookie. The shebang has to be the
         # first line of a file, the #coding:xxx cookie cannot be
@@ -328,13 +455,10 @@ class ScriptMaker(object):
         return result
 
     def _make_script(self, entry, filenames, options=None):
-        post_interp = b''
+        args = []
         if options:
             args = options.get('interpreter_args', [])
-            if args:
-                args = ' %s' % ' '.join(args)
-                post_interp = args.encode('utf-8')
-        shebang = self._get_shebang('utf-8', post_interp, options=options)
+        shebang = self._get_shebang('utf-8', args, options=options)
         script = self._get_script_text(entry).encode('utf-8')
         scriptnames = self.get_script_filenames(entry.name)
         if options and options.get('gui', False):
@@ -369,7 +493,9 @@ class ScriptMaker(object):
             match = FIRST_LINE_RE.match(first_line.replace(b'\r\n', b'\n'))
             if match:
                 adjust = True
-                post_interp = match.group(1) or b''
+                # Tokenize the arguments so that copied scripts go through the
+                # same direct/trampoline handling as generated entry points.
+                copied_args = _split_shebang_tail(match.group(1) or b'')
 
         if not adjust:
             if f:
@@ -383,7 +509,7 @@ class ScriptMaker(object):
             if not self._fileop.dry_run:
                 encoding, lines = detect_encoding(f.readline)
                 f.seek(0)
-                shebang = self._get_shebang(encoding, post_interp)
+                shebang = self._get_shebang(encoding, copied_args)
                 if b'pythonw' in first_line:  # pragma: no cover
                     ext = 'pyw'
                 else:

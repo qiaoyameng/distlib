@@ -583,9 +583,11 @@ class WheelTestCase(DistlibTestCase):
                 expected = fsencode(get_executable())
             else:
                 expected = executable.encode('utf-8')
-            expected = b'#!' + expected + b' -E'
+            direct = b'#!' + expected + b' -E'
+            trampoline = b'exec "' + expected + b'" "-E" "$0" "$@"'
             if not sysconfig.is_python_build():
-                self.assertIn(expected, data)
+                self.assertTrue(direct in data or trampoline in data,
+                                'neither direct shebang nor trampoline found in %r' % data)
 
     def test_verify(self):
         fn = os.path.join(HERE, 'dummy-0.1-py27-none-any.whl')

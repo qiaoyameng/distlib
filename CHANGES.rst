@@ -6,6 +6,18 @@ Change log for ``distlib``
 
 Released: Not yet.
 
+- scripts
+
+    - ``interpreter_args`` passed to :meth:`ScriptMaker.make` is now a
+      data-safe list of arguments: spaces, quotes and shell metacharacters no
+      longer change argument boundaries, and a plain string remains accepted
+      for backwards compatibility. A direct shebang is used when it can carry
+      the arguments faithfully; otherwise a POSIX shell trampoline is
+      generated which quotes every interpreter path and argument as data.
+      Prebuilt scripts copied from a wheel and generated console entry points
+      now follow the same handling, and a script's own arguments are appended
+      verbatim (``eval`` is not used).
+
 0.4.3
 ~~~~~
 

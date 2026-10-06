@@ -56,8 +56,11 @@ class ScriptTestCase(DistlibTestCase):
             self.assertEqual(d, self.maker.target_dir)
             if fn.endswith('.py') and fn != 'foo.py':  # no shebang in foo.py
                 with open(files[0], 'rb') as f:
-                    first_line = f.readline()
-                self.assertIn(executable, first_line)
+                    content = f.read()
+                # The interpreter appears verbatim either on the direct
+                # shebang line or (when the path is too long) inside the
+                # POSIX trampoline.
+                self.assertIn(executable, content)
 
     def test_shebangs_custom_executable(self):
         srcdir = tempfile.mkdtemp(prefix='distlib-test-')
@@ -92,11 +95,11 @@ class ScriptTestCase(DistlibTestCase):
         with open(filenames[0], 'rb') as f:
             first_line = f.readline()
             second_line = f.readline()
-            third_line = f.readline()
         self.assertEqual(first_line, b'#!/bin/sh\n')
-        self.assertEqual(second_line, b"'''exec' an executable with "
-                         b'spaces "$0" "$@"\n')
-        self.assertEqual(third_line, b"' '''\n")
+        # Every word of the executable is quoted as data, so spaces in the
+        # path don't change argument boundaries.
+        self.assertEqual(second_line,
+                         b"''''exec \"an executable with spaces\" \"$0\" \"$@\" # '''\n")
         # Python 3.3 cannot create a venv in an existing directory
         if venv and sys.version_info[:2] >= (3, 4):
             if sys.platform == 'darwin':
@@ -138,11 +141,9 @@ class ScriptTestCase(DistlibTestCase):
         with open(filenames[0], 'rb') as f:
             first_line = f.readline()
             second_line = f.readline()
-            third_line = f.readline()
         self.assertEqual(first_line, b'#!/bin/sh\n')
-        self.assertEqual(second_line, b"'''exec' /path/to/python3 "
-                         b'"$0" "$@"\n')
-        self.assertEqual(third_line, b"' '''\n")
+        self.assertEqual(second_line,
+                         b"''''exec \"/path/to/python3\" \"$0\" \"$@\" # '''\n")
 
     def test_multiple(self):
         specs = ('foo.py', 'script1.py', 'script2.py', 'script3.py', 'shell.sh', 'uwsgi_part')
@@ -376,15 +377,148 @@ class ScriptTestCase(DistlibTestCase):
 
     def test_interpreter_args(self):
         executable = fsencode(get_executable())
-        options = {'interpreter_args': ['-E', '"foo bar"', 'baz frobozz']}
+        # Each list entry is one argument: spaces and quotes are data, not
+        # shell syntax, so they are carried verbatim. Multiple tokens force the
+        # POSIX trampoline (the direct shebang can only carry one token).
+        options = {'interpreter_args': ['-E', 'foo bar', 'baz frobozz']}
         self.maker.variants = set([''])
         files = self.maker.make('foo = bar:baz', options=options)
         self.assertEqual(len(files), 1)
         with open(files[0], 'rb') as f:
+            lines = f.read().splitlines()
+        if os.name == 'posix':
+            self.assertEqual(lines[0], b'#!/bin/sh')
+            self.assertTrue(lines[1].startswith(b"''''exec "))
+            exec_line = lines[1]
+            # the executable word and each argument are quoted separately
+            for needle in (executable, b'"-E"', b'"foo bar"', b'"baz frobozz"'):
+                self.assertIn(needle, exec_line)
+            # and the script's own arguments are appended verbatim
+            self.assertIn(b'"$0" "$@"', exec_line)
+        else:
+            shebang_line = lines[0]
+            if not sysconfig.is_python_build():
+                self.assertIn(executable, shebang_line)
+            self.assertIn(b' -E foo bar baz frobozz', shebang_line)
+
+    def test_interpreter_args_string_compat(self):
+        # A plain string still works for backwards compatibility; it is split
+        # with POSIX shell rules, honoring quoting.
+        self.maker.variants = set([''])
+        self.maker.executable = 'mypython'
+        files = self.maker.make('foo = bar:baz', {'interpreter_args': '-E -S'})
+        with open(files[0], 'rb') as f:
             shebang_line = f.readline()
-        if not sysconfig.is_python_build():
-            self.assertIn(executable, shebang_line)
-        self.assertIn(b' -E "foo bar" baz frobozz', shebang_line)
+        self.assertEqual(shebang_line, b'#!/bin/sh\n')
+        with open(files[0], 'rb') as f:
+            exec_line = f.read().splitlines()[1]
+        self.assertIn(b'"-E" "-S"', exec_line)
+        # a single safe token uses the direct shebang
+        files = self.maker.make('baz = bar:baz', {'interpreter_args': '-E'})
+        with open(files[0], 'rb') as f:
+            shebang_line = f.readline()
+        self.assertEqual(shebang_line, b'#!mypython -E\n')
+
+    @unittest.skipIf(os.name != 'posix', 'Test only appropriate for '
+                     'POSIX systems')
+    def test_interpreter_args_execution(self):
+        # End-to-end checks: an "interpreter" which just echoes its own argv,
+        # driven through a real temporary directory whose path contains spaces
+        # and quotes. Generated console entry points and copied prebuilt
+        # scripts must yield identical interpreter argument sequences, and the
+        # script's own arguments must be appended verbatim (no eval).
+        root = tempfile.mkdtemp(prefix="distlib it's \"a\" ")
+        self.addCleanup(shutil.rmtree, root)
+        bindir = os.path.join(root, "bin dir")
+        srcdir = os.path.join(root, 'src')
+        os.makedirs(bindir)
+        os.makedirs(srcdir)
+
+        # The probe interpreter prints each received argv token on its own line.
+        probe = os.path.join(root, "py dir'quot", 'probe-interp')
+        os.makedirs(os.path.dirname(probe))
+        with open(probe, 'w') as f:
+            f.write('#!/bin/sh\n'
+                    'for token in "$@"; do printf "%s\\n" "$token"; done\n')
+        os.chmod(probe, 0o755)
+
+        # A prebuilt script in the wheel, complete with its own shebang args.
+        prebuilt_args = ['-E', 'foo bar', "a'b", 'a"b', 'a;b', '$HOME', '']
+        quoted_args = ' '.join(
+            '"%s"' % arg.replace('\\', '\\\\').replace('"', '\\"')
+            for arg in prebuilt_args)
+        with open(os.path.join(srcdir, 'prebuilt.py'), 'w') as f:
+            f.write('#!python %s\nprint("prebuilt")\n' % quoted_args)
+
+        maker = ScriptMaker(srcdir, bindir, add_launchers=False)
+        maker.variants = set([''])
+        maker.clobber = True
+        maker.force = True
+        maker.executable = probe
+
+        interp_args = ['-E', 'foo bar', "a'b", 'a"b', 'a;b', '$HOME', '']
+        copied = maker.make('prebuilt.py')
+        made = maker.make('prebuilt-ep = somepkg:main',
+                          {'interpreter_args': interp_args})
+
+        def tokens(path, *user_args):
+            p = subprocess.Popen([path] + list(user_args),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            self.assertEqual(p.returncode, 0, stderr)
+            return stdout.decode('utf-8').splitlines()
+
+        user_args = ['user arg one', 'two']
+        copied_tokens = tokens(copied[0], *user_args)
+        made_tokens = tokens(made[0], *user_args)
+
+        # Token 0..n-3 are the interpreter args, then $0 (the script path),
+        # then the script's own arguments appended verbatim.
+        expected_interp = ['-E', 'foo bar', "a'b", 'a"b', 'a;b', '$HOME', '']
+        self.assertEqual(copied_tokens[:-3], expected_interp)
+        self.assertEqual(made_tokens[:-3], expected_interp)
+        # Both generation routes produce the same interpreter argument vector.
+        self.assertEqual(copied_tokens[:-3], made_tokens[:-3])
+        # The last two tokens are the script's own arguments, unchanged.
+        self.assertEqual(copied_tokens[-2:], user_args)
+        self.assertEqual(made_tokens[-2:], user_args)
+        # $0 points at each script respectively.
+        self.assertEqual(copied_tokens[-3], copied[0])
+        self.assertEqual(made_tokens[-3], made[0])
+
+    @unittest.skipIf(os.name != 'posix', 'Test only appropriate for '
+                     'POSIX systems')
+    def test_long_path_fallback_and_empty_args(self):
+        # A short, simple executable with no args uses the direct shebang.
+        root = tempfile.mkdtemp(prefix='distlib-test-')
+        self.addCleanup(shutil.rmtree, root)
+        maker = ScriptMaker(root, root, add_launchers=False)
+        maker.variants = set([''])
+        maker.executable = '/usr/bin/python3'
+        files = maker.make('short = pkg:main')
+        with open(files[0], 'rb') as f:
+            self.assertEqual(f.readline(), b'#!/usr/bin/python3\n')
+
+        # A very long executable path forces the trampoline, even with no
+        # interpreter args at all.
+        long_exe = os.path.join(root, 'p' * 110, 'python')
+        maker.executable = long_exe
+        files = maker.make('long = pkg:main', {'interpreter_args': []})
+        with open(files[0], 'rb') as f:
+            self.assertEqual(f.readline(), b'#!/bin/sh\n')
+            exec_line = f.readline()
+            self.assertIn(('"%s"' % long_exe).encode('utf-8'), exec_line)
+            self.assertTrue(exec_line.startswith(b"''''exec "))
+            self.assertIn(b'"$0" "$@" # ' + b"'''", exec_line)
+
+        # An empty-string argument cannot live in a direct shebang and also
+        # forces the trampoline.
+        maker.executable = '/usr/bin/python3'
+        files = maker.make('empty = pkg:main', {'interpreter_args': ['']})
+        with open(files[0], 'rb') as f:
+            lines = f.read().splitlines()
+        self.assertEqual(lines[0], b'#!/bin/sh')
+        self.assertIn(b'"" "$0" "$@"', lines[1])
 
     def test_args_on_copy(self):
         self.maker.variants = set([''])
@@ -398,9 +532,16 @@ class ScriptTestCase(DistlibTestCase):
             os.remove(files[0])
             files = self.maker.make('script5.py')
             with open(files[0]) as f:
-                actual = f.readline().strip()
-            expected = '#!%s -mzippy.activate' % get_executable()
-            self.assertEqual(actual, expected)
+                content = f.read()
+            executable = get_executable()
+            # A short path yields a direct shebang ...
+            direct = '#!%s -mzippy.activate' % executable
+            # ... while a path that's too long (or contains spaces) yields the
+            # POSIX trampoline, where the interpreter and its argument are
+            # quoted individually as data.
+            trampoline = 'exec "%s" "-mzippy.activate" "$0" "$@"' % executable
+            self.assertTrue(direct in content or trampoline in content,
+                            'neither direct shebang nor trampoline found in %r' % content)
 
     def test_enquote_executable(self):
         for executable, expected in (('/no/spaces', '/no/spaces'), ('/i have/space', '"/i have/space"'),

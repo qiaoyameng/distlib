@@ -1193,8 +1193,17 @@ The string passed to make can take one of the following forms:
   should be used. (This only applies if ``add_launchers`` is true.)
 
   ``interpreter_args``: If provided, this should be a list of strings which
-  are added to the shebang line following the interpreter. If there are values
-  with spaces, you will need to surround them with double quotes.
+  are added to the shebang line following the interpreter. Each list entry is
+  a single argument and is passed to the interpreter verbatim: spaces,
+  quotes and shell metacharacters are treated as data, so you should not add
+  quoting yourself. A plain string is also accepted for backwards
+  compatibility and split using POSIX shell rules.
+
+  When the direct shebang can carry the arguments faithfully (a short,
+  space-free interpreter with at most one simple argument), it is used.
+  Otherwise a POSIX shell trampoline is generated which invokes the
+  interpreter with each path and argument quoted as data, so token boundaries
+  are preserved. The script's own arguments are always appended verbatim.
 
   .. note:: Use of this feature may affect portability, since POSIX does not
     standardise how these arguments are passed to the interpreter (see
