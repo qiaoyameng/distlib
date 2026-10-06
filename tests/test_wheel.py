@@ -23,6 +23,7 @@ from distlib.database import DistributionPath
 from distlib.manifest import Manifest
 from distlib.metadata import Metadata, METADATA_FILENAME, LEGACY_METADATA_FILENAME
 from distlib.scripts import ScriptMaker
+from distlib.spdx import SPDXExpressionError
 from distlib.util import get_executable
 from distlib.wheel import (Wheel, PYVER, IMPVER, ARCH, ABI, COMPATIBLE_TAGS, IMP_PREFIX, VER_SUFFIX,
                            is_compatible, _get_glibc_version)
@@ -598,6 +599,102 @@ class WheelTestCase(DistlibTestCase):
         fn = os.path.join(HERE, 'bad_wheels', 'dummy-0.1-py27-none-any.whl')
         w = Wheel(fn)
         self.assertRaises(DistlibException, w.verify)
+
+    def make_pep639_wheel(self, expression=None, files=None,
+                         existing_files=None, name='pep639pkg',
+                         version='1.0'):
+        """Build a wheel carrying PEP 639 metadata and return its path."""
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        purelib = os.path.join(workdir, 'purelib')
+        distinfo = os.path.join(purelib, '%s-%s.dist-info' % (name, version))
+        os.makedirs(distinfo)
+        with open(os.path.join(purelib, '%s.py' % name), 'w') as f:
+            f.write('value = 1\n')
+
+        from distlib.metadata import LegacyMetadata
+        md = LegacyMetadata(mapping={'name': name, 'version': version})
+        md['Summary'] = 'PEP 639 test package'
+        if expression is not None:
+            md['License-Expression'] = expression
+        if files is not None:
+            md['License-File'] = files
+        md.write(os.path.join(distinfo, LEGACY_METADATA_FILENAME),
+                 skip_unknown=True)
+        for relpath in existing_files or ():
+            target = os.path.join(distinfo, relpath)
+            if not os.path.isdir(os.path.dirname(target)):
+                os.makedirs(os.path.dirname(target))
+            with open(target, 'w') as f:
+                f.write('license text for %s\n' % relpath)
+
+        wheel = Wheel('%s-%s' % (name, version))
+        wheel.dirname = workdir
+        return wheel.build({'purelib': purelib})
+
+    def test_pep639_wheel_roundtrip(self):
+        expression = 'MIT AND (BSD-2-Clause OR Apache-2.0)'
+        files = ['licenses/LICENSE-MIT', 'licenses/LICENSE-APACHE']
+        path = self.make_pep639_wheel(expression, files, files)
+
+        wheel = Wheel(path)
+        wheel.verify()
+        with ZipFile(path) as zf:
+            names = set(zf.namelist())
+            metadata_name = 'pep639pkg-1.0.dist-info/%s' % (
+                LEGACY_METADATA_FILENAME)
+            raw = zf.read(metadata_name).decode('utf-8')
+        self.assertIn('pep639pkg-1.0.dist-info/licenses/LICENSE-MIT', names)
+        self.assertIn('pep639pkg-1.0.dist-info/licenses/LICENSE-APACHE',
+                      names)
+        # Structured expression preserved verbatim, not folded into a
+        # description string; multiple License-File lines kept in order.
+        lines = [line for line in raw.splitlines()
+                 if line.startswith(('License-Expression:', 'License-File:'))]
+        self.assertEqual(lines, [
+            'License-Expression: %s' % expression,
+            'License-File: %s' % files[0],
+            'License-File: %s' % files[1],
+        ])
+
+        # Read back through the Metadata API
+        from distlib.metadata import LegacyMetadata
+        from distlib.compat import StringIO
+        reread = LegacyMetadata(fileobj=StringIO(raw))
+        self.assertEqual(reread['License-Expression'], expression)
+        self.assertEqual(reread['License-File'], files)
+
+    def test_pep639_wheel_missing_license_file(self):
+        # Declared in metadata, but no such file inside the wheel.
+        path = self.make_pep639_wheel(
+            expression='MIT',
+            files=['licenses/LICENSE-MIT', 'licenses/LICENSE-APACHE'],
+            existing_files=['licenses/LICENSE-APACHE'])
+        wheel = Wheel(path)
+        self.assertRaises(DistlibException, wheel.verify)
+
+    def test_pep639_wheel_parent_directory_license_file(self):
+        path = self.make_pep639_wheel(
+            expression='MIT', files=['../evil.txt'])
+        wheel = Wheel(path)
+        self.assertRaises(DistlibException, wheel.verify)
+
+    def test_pep639_wheel_invalid_expression(self):
+        path = self.make_pep639_wheel(
+            expression='MIT AND OR BSD-2-Clause')
+        wheel = Wheel(path)
+        self.assertRaises(DistlibException, wheel.verify)
+
+    def test_pep639_wheel_unknown_identifier_not_a_wheel_error(self):
+        # Wheel verification has no local identifier catalogue, so a
+        # syntactically valid but unknown SPDX id is not a wheel error;
+        # auditing callers pass a catalogue to LegacyMetadata.check().
+        path = self.make_pep639_wheel(
+            expression='NoSuchLicense',
+            files=['licenses/LICENSE'],
+            existing_files=['licenses/LICENSE'])
+        wheel = Wheel(path)
+        wheel.verify()
 
     def wheel_modifier_nop(self, path_map):
         return False

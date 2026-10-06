@@ -18,6 +18,7 @@ import re
 from . import DistlibException, __version__
 from .compat import StringIO, string_types, text_type
 from .markers import interpret
+from .spdx import SPDXExpressionError, parse_spdx_expression
 from .util import extract_by_key, get_extras
 from .version import get_scheme, PEP440_VERSION_RE
 
@@ -231,6 +232,35 @@ _UNICODEFIELDS = ('Author', 'Maintainer', 'Summary', 'Description')
 _MISSING = object()
 
 _FILESAFE = re.compile('[^A-Za-z0-9.]+')
+
+# PEP 639: a License-File is a POSIX-style path relative to the
+# .dist-info directory. It must not be absolute, escape the directory
+# via a parent reference, or use backslashes as separators.
+_LICENSE_FILE_SEGMENT_RE = re.compile(r'^[A-Za-z0-9._-]+$')
+
+
+def validate_license_file(path):
+    """Validate a single License-File value per PEP 639.
+
+    Returns True when *path* is a valid relative path, otherwise raises
+    :class:`MetadataInvalidError`.
+    """
+    if not isinstance(path, string_types) or not path:
+        raise MetadataInvalidError('License-File must be a non-empty string')
+    if '\\' in path:
+        raise MetadataInvalidError('License-File %r must use POSIX paths with '
+                                   'forward slashes' % path)
+    if path.startswith('/'):
+        raise MetadataInvalidError('License-File %r must be a relative path' % path)
+    segments = path.split('/')
+    if '..' in segments or '.' in segments or '' in segments:
+        raise MetadataInvalidError('License-File %r must not contain absolute, '
+                                   'current-directory or parent-directory references' % path)
+    for segment in segments:
+        if not _LICENSE_FILE_SEGMENT_RE.match(segment):
+            raise MetadataInvalidError('License-File %r contains an invalid path '
+                                       'segment %r' % (path, segment))
+    return True
 
 
 def _get_name_and_version(name, version, for_filename=False):
@@ -504,9 +534,14 @@ class LegacyMetadata(object):
                 return value.split(',')
         return self._fields[name]
 
-    def check(self, strict=False):
+    def check(self, strict=False, spdx_licenses=None, spdx_exceptions=None):
         """Check if the metadata is compliant. If strict is True then raise if
-        no Name or Version are provided"""
+        no Name or Version are provided
+
+        *spdx_licenses* and *spdx_exceptions* are optional iterables of
+        identifiers used to validate License-Expression values (PEP 639).
+        When not supplied, only the syntax of SPDX expressions is checked.
+        """
         self.set_metadata_version()
 
         # XXX should check the versions (if the file was loaded)
@@ -524,8 +559,14 @@ class LegacyMetadata(object):
             if attr not in self:
                 missing.append(attr)
 
+        version = self['Metadata-Version']
+
+        # PEP 639 constraints apply to metadata 2.4 and later
+        if version in ('2.4', '2.5'):
+            warnings.extend(self.check_license_fields(spdx_licenses, spdx_exceptions))
+
         # checking metadata 1.2 (XXX needs to check 1.1, 1.0)
-        if self['Metadata-Version'] != '1.2':
+        if version != '1.2':
             return missing, warnings
 
         scheme = get_scheme(self.scheme)
@@ -545,6 +586,54 @@ class LegacyMetadata(object):
                     warnings.append("Wrong value for '%s': %s" % (field, value))
 
         return missing, warnings
+
+    def check_license_fields(self, spdx_licenses=None, spdx_exceptions=None, strict=False):
+        """Validate the PEP 639 license fields (metadata 2.4 and later).
+
+        - License-Expression must be a syntactically valid SPDX expression,
+          validated against the optional caller-supplied identifier
+          catalogues;
+        - License and License-Expression are mutually exclusive; the
+          License-Expression field is also mutually exclusive with license
+          classifiers;
+        - every License-File value must be a POSIX-style relative path
+          which does not escape the .dist-info directory.
+
+        Returns a list of diagnostic strings. When *strict* is True, the
+        first problem is raised as a :class:`MetadataInvalidError` instead.
+        """
+        warnings = []
+
+        def report(message):
+            if strict:
+                raise MetadataInvalidError(message)
+            warnings.append(message)
+
+        expression = self.get('License-Expression', None)
+        has_expression = expression not in (None, 'UNKNOWN')
+        if has_expression:
+            try:
+                parse_spdx_expression(expression, spdx_licenses, spdx_exceptions)
+            except SPDXExpressionError as e:
+                report("Invalid License-Expression: %s" % e)
+
+        license_text = self.get('License', None)
+        if has_expression and license_text not in (None, 'UNKNOWN'):
+            report("'License' must not be used together with 'License-Expression'")
+
+        if has_expression:
+            for classifier in self.get('Classifier') or []:
+                if classifier.split('::', 1)[0].strip() == 'License':
+                    report("License classifier %r must not be used together with "
+                           "'License-Expression'" % classifier)
+
+        for path in self.get('License-File') or []:
+            try:
+                validate_license_file(path)
+            except MetadataInvalidError as e:
+                report(str(e))
+
+        return warnings
 
     def todict(self, skip_missing=False):
         """Return fields as a dict.

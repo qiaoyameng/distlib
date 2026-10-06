@@ -15,6 +15,7 @@ from test_markers import MarkersTestCase
 from test_metadata import MetadataTestCase, LegacyMetadataTestCase
 from test_resources import (ZipResourceTestCase, FileResourceTestCase, CacheTestCase)
 from test_scripts import ScriptTestCase
+from test_spdx import SPDXParserTestCase
 from test_version import (VersionTestCase, CompatibilityTestCase, LegacyVersionTestCase, SemanticVersionTestCase)
 from test_wheel import WheelTestCase
 

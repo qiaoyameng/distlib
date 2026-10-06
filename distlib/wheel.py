@@ -24,7 +24,9 @@ import zipfile
 from . import __version__, DistlibException
 from .compat import sysconfig, ZipFile, fsdecode, text_type, filter
 from .database import InstalledDistribution
-from .metadata import Metadata, WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME
+from .metadata import (Metadata, WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME,
+                       validate_license_file)
+from .spdx import SPDXExpressionError, parse_spdx_expression
 from .util import (FileOperator, convert_path, CSVReader, CSVWriter, Cache, cached_property, get_cache_base,
                    read_exports, tempdir, get_platform, is_in_directory)
 from .version import NormalizedVersion, UnsupportedVersionError
@@ -860,6 +862,8 @@ class Wheel(object):
             # file_version = tuple([int(i) for i in wv])
             # TODO version verification
 
+            self._verify_license_fields(zf, info_dir)
+
             records = {}
             with zf.open(record_name) as bf:
                 with CSVReader(stream=bf) as reader:
@@ -895,6 +899,42 @@ class Wheel(object):
                     if digest != value:
                         raise DistlibException('digest mismatch for '
                                                '%s' % arcname)
+
+    def _verify_license_fields(self, zf, info_dir):
+        """Check PEP 639 license fields against the wheel contents.
+
+        License-File entries must be relative paths within the
+        .dist-info directory and must name files that are actually
+        present in the wheel. A License-Expression, when present, must
+        parse as an SPDX expression (identifier catalogues are not
+        available locally, so only syntax is checked here).
+        """
+        metadata_name = posixpath.join(info_dir, LEGACY_METADATA_FILENAME)
+        try:
+            with zf.open(metadata_name) as bf:
+                wf = codecs.getreader('utf-8')(bf)
+                message = message_from_file(wf)
+        except KeyError:
+            return
+
+        expression = message.get('License-Expression')
+        if expression:
+            try:
+                parse_spdx_expression(expression)
+            except SPDXExpressionError as e:
+                raise DistlibException('invalid License-Expression %r: %s'
+                                       % (expression, e))
+
+        names = set(name for name in zf.namelist() if not name.endswith('/'))
+        for path in message.get_all('License-File') or []:
+            try:
+                validate_license_file(path)
+            except Exception as e:
+                raise DistlibException('invalid License-File %r: %s' % (path, e))
+            archive_path = posixpath.join(info_dir, path)
+            if archive_path not in names:
+                raise DistlibException('License-File %r is declared in metadata '
+                                       'but missing from the wheel' % path)
 
     def update(self, modifier, dest_dir=None, **kwargs):
         """

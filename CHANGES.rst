@@ -6,6 +6,24 @@ Change log for ``distlib``
 
 Released: Not yet.
 
+- metadata
+
+    - Added support for the PEP 639 ``License-Expression`` and
+      ``License-File`` fields (metadata 2.4). SPDX license expressions are
+      parsed into a structure-preserving syntax tree (``distlib.spdx``)
+      covering AND/OR/WITH, parentheses and LicenseRef; identifier
+      catalogues can optionally be supplied by the caller and are never
+      downloaded. ``License-File`` values stay as an ordered list of
+      POSIX-style relative paths, and ``check()`` reports conflicts with
+      the legacy ``License`` field and license classifiers.
+
+- wheel
+
+    - ``Wheel.verify()`` now validates PEP 639 fields: the
+      ``License-Expression`` must be a well-formed SPDX expression, each
+      ``License-File`` must be a safe relative path, and the referenced
+      files must be present in the ``.dist-info`` directory of the wheel.
+
 0.4.3
 ~~~~~
 

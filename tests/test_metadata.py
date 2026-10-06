@@ -18,7 +18,8 @@ from distlib import __version__
 from distlib.compat import StringIO
 from distlib.metadata import (LegacyMetadata, Metadata, METADATA_FILENAME, LEGACY_METADATA_FILENAME,
                               PKG_INFO_PREFERRED_VERSION, MetadataMissingError, MetadataUnrecognizedVersionError,
-                              MetadataInvalidError, _ATTR2FIELD)
+                              MetadataInvalidError, _ATTR2FIELD, validate_license_file)
+from distlib.spdx import SPDXExpressionError
 
 from support import LoggingCatcher, TempdirManager, DistlibTestCase, in_github_workflow
 
@@ -458,6 +459,138 @@ class LegacyMetadataTestCase(LoggingCatcher, TempdirManager, DistlibTestCase):
         self.assertFalse(md.is_multi_field('Name'))
         self.assertTrue(md.is_field('Obsoleted-By'))
         self.assertFalse(md.is_field('Frobozz'))
+
+
+    #
+    # PEP 639 (metadata 2.4): License-Expression and License-File
+    #
+
+    def make_pep639_metadata(self, expression=None, files=None):
+        md = LegacyMetadata(mapping={'name': 'project', 'version': '1.0'})
+        if expression is not None:
+            md['License-Expression'] = expression
+        if files is not None:
+            md['License-File'] = files
+        md.set_metadata_version()
+        return md
+
+    def test_pep639_selects_metadata_2_4(self):
+        md = self.make_pep639_metadata('MIT', ['licenses/LICENSE'])
+        self.assertEqual(md['Metadata-Version'], '2.4')
+
+    def test_pep639_read_write_roundtrip(self):
+        expression = 'MIT AND (BSD-2-Clause OR Apache-2.0)'
+        files = ['licenses/LICENSE-MIT', 'licenses/LICENSE-APACHE']
+        md = self.make_pep639_metadata(expression, files)
+        fp = StringIO()
+        md.write_file(fp, skip_unknown=True)
+        text = fp.getvalue()
+        # License-Expression is a single line, not folded together
+        self.assertIn('License-Expression: %s\n' % expression, text)
+        # License-File values remain separate, ordered lines
+        self.assertIn('License-File: %s\n' % files[0], text)
+        self.assertIn('License-File: %s\n' % files[1], text)
+        self.assertLess(text.index(files[0]), text.index(files[1]))
+
+        reread = LegacyMetadata(fileobj=StringIO(text))
+        self.assertEqual(reread['License-Expression'], expression)
+        self.assertEqual(reread['License-File'], files)
+        missing, warnings = reread.check()
+        self.assertEqual(warnings, [])
+
+    def test_pep639_license_expression_valid(self):
+        for expression in ('MIT', 'MIT AND BSD-2-Clause',
+                           'MIT OR Apache-2.0',
+                           'MIT AND (BSD-2-Clause OR Apache-2.0)',
+                           'GPL-2.0-only WITH Classpath-exception-2.0',
+                           'LicenseRef-Proprietary',
+                           'DocumentRef-SPA:LicenseRef-Proprietary'):
+            md = self.make_pep639_metadata(expression)
+            self.assertEqual(md.check_license_fields(), [], expression)
+
+    def test_pep639_license_expression_with_catalogue(self):
+        catalog = ('MIT', 'BSD-2-Clause', 'Apache-2.0', 'GPL-2.0-only')
+        exceptions = ('Classpath-exception-2.0',)
+        md = self.make_pep639_metadata(
+            'mit AND (bsd-2-clause OR apache-2.0)')
+        self.assertEqual(md.check_license_fields(catalog, exceptions), [])
+        # The stored value is untouched; the catalogue is only used by
+        # callers which want strict identifier checking.
+        md = self.make_pep639_metadata('NoSuchLicense')
+        warnings = md.check_license_fields(catalog, exceptions)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('Unknown SPDX license identifier', warnings[0])
+        md = self.make_pep639_metadata('MIT WITH NoSuchException')
+        warnings = md.check_license_fields(catalog, exceptions)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('Unknown SPDX license exception identifier',
+                      warnings[0])
+
+    def test_pep639_invalid_license_expression(self):
+        for expression in ('MIT AND OR', 'MIT AND', '(MIT', 'A AND B OR C',
+                           '..', 'MIT +'):
+            md = self.make_pep639_metadata(expression)
+            warnings = md.check_license_fields()
+            self.assertEqual(len(warnings), 1, expression)
+            self.assertTrue(warnings[0].startswith(
+                'Invalid License-Expression:'), expression)
+
+    def test_pep639_license_expression_strict_raises(self):
+        md = self.make_pep639_metadata('NoSuchLicense')
+        self.assertRaises(MetadataInvalidError, md.check_license_fields,
+                          ('MIT',), (), True)
+
+    def test_pep639_mutex_license(self):
+        md = self.make_pep639_metadata('MIT')
+        md['License'] = 'Free-form old license text'
+        warnings = md.check_license_fields()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("'License' must not be used together with "
+                      "'License-Expression'", warnings)
+
+    def test_pep639_mutex_license_classifier(self):
+        md = self.make_pep639_metadata('MIT')
+        md['Classifier'] = [
+            'License :: OSI Approved :: MIT License',
+            'Programming Language :: Python :: 3',
+        ]
+        warnings = md.check_license_fields()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('License classifier', warnings[0])
+        # Non-license classifiers alone are fine
+        md['Classifier'] = ['Programming Language :: Python :: 3']
+        self.assertEqual(md.check_license_fields(), [])
+
+    def test_pep639_license_file_order_preserved(self):
+        files = ['licenses/c.txt', 'licenses/a.txt', 'licenses/b.txt',
+                 'COPYING']
+        md = self.make_pep639_metadata('MIT', files)
+        self.assertEqual(md['License-File'], files)
+        self.assertEqual(md.check_license_fields(), [])
+
+    def test_pep639_license_file_path_validation(self):
+        for path in ('../evil.txt', '/absolute.txt', 'a/../b.txt',
+                     'a/./b', 'a//b', 'licenses\\LICENSE', ''):
+            self.assertRaises(MetadataInvalidError, validate_license_file,
+                              path)
+        for path in ('licenses/LICENSE', 'LICENSE', 'a/b-c_d.e/f.txt'):
+            self.assertTrue(validate_license_file(path))
+
+        md = self.make_pep639_metadata('MIT', ['../evil.txt',
+                                               'licenses/ok.txt'])
+        warnings = md.check_license_fields()
+        self.assertEqual(len(warnings), 1)
+        self.assertIn('../evil.txt', warnings[0])
+
+    def test_pep639_old_license_unchanged_for_old_versions(self):
+        # Free-form License text without License-Expression keeps the
+        # historical behaviour and selects no 2.4-specific version.
+        md = LegacyMetadata(mapping={'name': 'project', 'version': '1.0'})
+        md['License'] = 'Some free-form license'
+        md.set_metadata_version()
+        self.assertNotIn('License-Expression', md)
+        missing, warnings = md.check()
+        self.assertEqual(warnings, [])
 
 
 class MetadataTestCase(LoggingCatcher, TempdirManager, DistlibTestCase):
