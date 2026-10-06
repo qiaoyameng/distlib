@@ -16,6 +16,7 @@ import logging
 import re
 
 from . import DistlibException, __version__
+from .spdx import SPDXError, normalize_license_expression
 from .compat import StringIO, string_types, text_type
 from .markers import interpret
 from .util import extract_by_key, get_extras
@@ -232,6 +233,30 @@ _MISSING = object()
 
 _FILESAFE = re.compile('[^A-Za-z0-9.]+')
 
+_WINDOWS_ABSOLUTE_RE = re.compile(r'^([A-Za-z]:[\\/]|\\\\)')
+
+
+def validate_license_file_path(value):
+    """
+    Validate a ``License-File`` value as per PEP 639: it must be a non-empty
+    relative path using ``/`` as the separator, without parent-directory
+    (``..``) components.
+
+    Returns None if the value is valid, else a string describing the problem.
+    """
+    if not value or not value.strip():
+        return 'path must not be empty'
+    if '\\' in value:
+        return "path must use '/' as the separator: %r" % value
+    if value.startswith('/') or _WINDOWS_ABSOLUTE_RE.match(value):
+        return 'path must be relative, not absolute: %r' % value
+    parts = value.split('/')
+    if any(not part for part in parts):
+        return 'path must not contain empty components: %r' % value
+    if '..' in parts:
+        return "path must not contain '..' parent directory components: %r" % value
+    return None
+
 
 def _get_name_and_version(name, version, for_filename=False):
     """Return the distribution name with version.
@@ -259,13 +284,16 @@ class LegacyMetadata(object):
 
     # TODO document the mapping API and UNKNOWN default key
 
-    def __init__(self, path=None, fileobj=None, mapping=None, scheme='default'):
+    def __init__(self, path=None, fileobj=None, mapping=None, scheme='default', license_catalog=None):
         if [path, fileobj, mapping].count(None) < 2:
             raise TypeError('path, fileobj and mapping are exclusive')
         self._fields = {}
         self.requires_files = []
         self._dependencies = None
         self.scheme = scheme
+        # Optional SPDX identifier catalogue (see distlib.spdx) used to
+        # validate License-Expression values. Never fetched from a network.
+        self.license_catalog = license_catalog
         if path is not None:
             self.read(path)
         elif fileobj is not None:
@@ -524,6 +552,8 @@ class LegacyMetadata(object):
             if attr not in self:
                 missing.append(attr)
 
+        self._check_license_fields(warnings)
+
         # checking metadata 1.2 (XXX needs to check 1.1, 1.0)
         if self['Metadata-Version'] != '1.2':
             return missing, warnings
@@ -545,6 +575,36 @@ class LegacyMetadata(object):
                     warnings.append("Wrong value for '%s': %s" % (field, value))
 
         return missing, warnings
+
+    def _check_license_fields(self, warnings):
+        """
+        Check the licensing fields against the PEP 639 constraints. These
+        apply to metadata versions >= 2.4 (which is when License-Expression
+        and License-File may appear). A legacy free-text License value on
+        older metadata versions is left alone, as per the rules for those
+        versions.
+        """
+        expression = self._fields.get('License-Expression')
+        license_files = self._fields.get('License-File')
+        if not expression and not license_files:
+            return
+        legacy_license = self._fields.get('License')
+        if expression and legacy_license not in (None, '', 'UNKNOWN'):
+            warnings.append('License-Expression and License are mutually '
+                            'exclusive (PEP 639); License is deprecated')
+        if expression:
+            try:
+                normalize_license_expression(expression, self.license_catalog)
+            except SPDXError as e:
+                warnings.append("Invalid License-Expression value: %s" % e)
+            classifiers = self._fields.get('Classifier') or []
+            if any(c == 'License' or c.startswith('License ::') for c in classifiers):
+                warnings.append('License classifiers are deprecated when '
+                                'License-Expression is used (PEP 639)')
+        for value in license_files or []:
+            problem = validate_license_file_path(value)
+            if problem:
+                warnings.append('Invalid License-File value: %s' % problem)
 
     def todict(self, skip_missing=False):
         """Return fields as a dict.
@@ -709,6 +769,8 @@ class Metadata(object):
         'classifiers': ('Classifier', list),
         'source_url': ('Download-URL', None),
         'metadata_version': ('Metadata-Version', None),
+        'license_expression': ('License-Expression', None),
+        'license_files': ('License-File', list),
     }
 
     del none_list, none_dict
@@ -928,6 +990,9 @@ class Metadata(object):
                 else:
                     nk = k
                 result[nk] = lmd[k]
+        for ok, nk in (('license_expression', 'license_expression'), ('license_file', 'license_files')):
+            if ok in lmd and lmd[ok] not in ('UNKNOWN', [], ['UNKNOWN']):
+                result[nk] = lmd[ok]
         kw = lmd.get('Keywords', [])
         if kw == ['']:
             kw = []
@@ -944,6 +1009,8 @@ class Metadata(object):
     LEGACY_MAPPING = {
         'name': 'Name',
         'version': 'Version',
+        'license_expression': 'License-Expression',
+        'license_files': 'License-File',
         ('extensions', 'python.details', 'license'): 'License',
         'summary': 'Summary',
         'description': 'Description',

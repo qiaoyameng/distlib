@@ -6,6 +6,28 @@ Change log for ``distlib``
 
 Released: Not yet.
 
+- metadata
+
+    - Add support for PEP 639 (Core Metadata 2.4): the License-Expression and
+      License-File fields are now validated when checking metadata - License
+      and License-Expression are mutually exclusive, License-Expression must
+      be a valid SPDX expression, and License-File values must be relative
+      paths without parent-directory components. Legacy free-text License
+      values on older metadata versions are still handled by the original
+      rules.
+
+- spdx
+
+    - Add a new distlib.spdx module providing structure-preserving parsing
+      and normalisation of SPDX license expressions (AND/OR/WITH,
+      parentheses, LicenseRef). An identifier catalogue can optionally be
+      supplied by the caller; nothing is fetched from the network.
+
+- wheel
+
+    - Add Wheel.check_license_files() to verify that License-File entries
+      declared in wheel metadata exist under {name}-{version}.dist-info/licenses/.
+
 0.4.3
 ~~~~~
 

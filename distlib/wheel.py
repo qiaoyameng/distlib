@@ -24,7 +24,8 @@ import zipfile
 from . import __version__, DistlibException
 from .compat import sysconfig, ZipFile, fsdecode, text_type, filter
 from .database import InstalledDistribution
-from .metadata import Metadata, WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME
+from .metadata import (Metadata, WHEEL_METADATA_FILENAME, LEGACY_METADATA_FILENAME,
+                       validate_license_file_path)
 from .util import (FileOperator, convert_path, CSVReader, CSVWriter, Cache, cached_property, get_cache_base,
                    read_exports, tempdir, get_platform, is_in_directory)
 from .version import NormalizedVersion, UnsupportedVersionError
@@ -289,6 +290,33 @@ class Wheel(object):
             wf = codecs.getreader('utf-8')(bf)
             message = message_from_file(wf)
         return dict(message)
+
+    def check_license_files(self):
+        """
+        Check the ``License-File`` entries declared in the wheel's metadata
+        (PEP 639): each value must be a valid relative path and the
+        corresponding file must be present in the wheel under
+        ``{name}-{version}.dist-info/licenses/``.
+
+        Returns a list of problem descriptions; an empty list means the
+        wheel's license files are all present and correctly declared.
+        """
+        problems = []
+        license_files = self.metadata.license_files or []
+        name_ver = '%s-%s' % (self.name, self.version)
+        licenses_dir = posixpath.join('%s.dist-info' % name_ver, 'licenses')
+        pathname = os.path.join(self.dirname, self.filename)
+        with ZipFile(pathname, 'r') as zf:
+            names = set(zf.namelist())
+        for value in license_files:
+            problem = validate_license_file_path(value)
+            if problem:
+                problems.append('Invalid License-File value: %s' % problem)
+                continue
+            arcname = posixpath.join(licenses_dir, value)
+            if arcname not in names:
+                problems.append('License file %r not found in wheel at %r' % (value, arcname))
+        return problems
 
     @cached_property
     def info(self):

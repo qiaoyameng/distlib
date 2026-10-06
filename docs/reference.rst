@@ -1543,6 +1543,18 @@ Classes
 
       .. versionadded:: 0.1.8
 
+    .. method:: check_license_files()
+
+      Check the ``License-File`` entries declared in the wheel's metadata
+      (PEP 639): each value must be a valid relative path, and the
+      corresponding file must be present in the wheel under
+      ``{name}-{version}.dist-info/licenses/``.
+
+      Returns a list of problem descriptions; an empty list means the
+      wheel's license files are all present and correctly declared.
+
+      .. versionadded:: 0.4.4
+
     .. method:: update(modifier, dest_dir=None, **kwargs)
 
       Allows a user-defined callable access to the contents of a wheel. The
@@ -1739,6 +1751,57 @@ Functions
 
    This function returns the result of interpreting an environment marker in optional
    execution context, which is used for name lookups.
+
+
+The ``distlib.spdx`` package
+----------------------------
+
+.. currentmodule:: distlib.spdx
+
+This package has functionality for parsing and normalising SPDX license
+expressions, as used by the ``License-Expression`` field defined in PEP 639
+(Core Metadata 2.4). No identifier catalogue is bundled and nothing is
+fetched from the network - callers may optionally supply their own catalogue
+of known identifiers.
+
+Classes
+^^^^^^^
+
+.. class:: LicenseCatalog(licenses=(), exceptions=())
+
+   A catalogue of known SPDX license and exception identifiers, supplied by
+   the caller. Lookups are case-insensitive and return the canonical
+   (catalogue) spelling of an identifier.
+
+Functions
+^^^^^^^^^
+
+.. function:: parse_license_expression(text, catalog=None)
+
+   Parse an SPDX license expression and return its structure (a tree of
+   ``License``, ``With``, ``And`` and ``Or`` nodes). Handles the ``AND``,
+   ``OR`` and ``WITH`` operators, parentheses and ``LicenseRef`` custom
+   references. Raises :class:`SPDXError` for invalid expressions and, if a
+   catalogue is supplied, for unknown identifiers.
+
+.. function:: normalize_license_expression(text, catalog=None)
+
+   Parse an SPDX license expression and return its normalised form:
+   operators are upper-cased, identifiers use the canonical catalogue
+   spelling (if a catalogue is supplied) and the parenthesisation of the
+   source expression is preserved.
+
+.. function:: extract_license_identifiers(text, catalog=None)
+
+   Parse an SPDX license expression and return the sorted set of license
+   identifiers it uses.
+
+Exceptions
+^^^^^^^^^^
+
+.. exception:: SPDXError
+
+   Raised when an SPDX license expression is invalid.
 
 
 Next steps

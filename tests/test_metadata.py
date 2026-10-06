@@ -18,7 +18,8 @@ from distlib import __version__
 from distlib.compat import StringIO
 from distlib.metadata import (LegacyMetadata, Metadata, METADATA_FILENAME, LEGACY_METADATA_FILENAME,
                               PKG_INFO_PREFERRED_VERSION, MetadataMissingError, MetadataUnrecognizedVersionError,
-                              MetadataInvalidError, _ATTR2FIELD)
+                              MetadataInvalidError, validate_license_file_path, _ATTR2FIELD)
+from distlib.spdx import LicenseCatalog
 
 from support import LoggingCatcher, TempdirManager, DistlibTestCase, in_github_workflow
 
@@ -653,6 +654,145 @@ class MetadataTestCase(LoggingCatcher, TempdirManager, DistlibTestCase):
         md.validate()
         md.summary = ' '
         md.validate()
+
+
+class PEP639TestCase(DistlibTestCase):
+    """Tests for PEP 639 (Core Metadata 2.4) licensing fields."""
+
+    CATALOG = LicenseCatalog(
+        licenses=('MIT', 'Apache-2.0', 'BSD-3-Clause'),
+        exceptions=('LLVM-exception', ),
+    )
+
+    EXPRESSION = '(MIT OR Apache-2.0) AND BSD-3-Clause WITH LLVM-exception'
+
+    LICENSE_FILES = ['LICENSES/MIT.txt', 'LICENSES/Apache-2.0.txt']
+
+    def make_metadata(self, **kwargs):
+        md = LegacyMetadata(license_catalog=self.CATALOG)
+        md['Name'] = 'foo'
+        md['Version'] = '1.0'
+        md['License-Expression'] = self.EXPRESSION
+        md['License-File'] = list(self.LICENSE_FILES)
+        md['Metadata-Version'] = '2.4'
+        for k, v in kwargs.items():
+            md[k] = v
+        return md
+
+    def test_fields_recognised(self):
+        md = LegacyMetadata()
+        self.assertTrue(md.is_field('License-Expression'))
+        self.assertTrue(md.is_field('License-File'))
+        self.assertFalse(md.is_multi_field('License-Expression'))
+        self.assertTrue(md.is_multi_field('License-File'))
+
+    def test_version_detection(self):
+        md = self.make_metadata()
+        md.set_metadata_version()
+        self.assertEqual(md['Metadata-Version'], '2.4')
+
+    def test_read_write_round_trip(self):
+        md = self.make_metadata()
+        self.assertEqual(md.check(), (['Home-page', 'Author'], []))
+        buf = StringIO()
+        md.write_file(buf, skip_unknown=True)
+        text = buf.getvalue()
+        self.assertIn('Metadata-Version: 2.4\n', text)
+        self.assertIn('License-Expression: %s\n' % self.EXPRESSION, text)
+        # multiple License-File entries, order preserved
+        self.assertIn('License-File: LICENSES/MIT.txt\nLicense-File: LICENSES/Apache-2.0.txt\n', text)
+        md2 = LegacyMetadata(fileobj=StringIO(text), license_catalog=self.CATALOG)
+        self.assertEqual(md2['Metadata-Version'], '2.4')
+        self.assertEqual(md2['License-Expression'], self.EXPRESSION)
+        self.assertEqual(md2['License-File'], self.LICENSE_FILES)
+        self.assertEqual(md2.check(), (['Home-page', 'Author'], []))
+
+    def test_values_kept_structured(self):
+        # License-Expression / License-File must not be folded into the
+        # License or Description text fields
+        md = self.make_metadata()
+        d = md.todict()
+        self.assertEqual(d['license_expression'], self.EXPRESSION)
+        self.assertEqual(d['license_file'], self.LICENSE_FILES)
+        self.assertNotIn(self.EXPRESSION, md['License'])
+        self.assertNotIn(self.EXPRESSION, md['Description'])
+
+    def test_mutually_exclusive_license(self):
+        md = self.make_metadata(**{'License': 'Some free-form license text'})
+        missing, warnings = md.check()
+        self.assertTrue(any('mutually exclusive' in w for w in warnings), warnings)
+
+    def test_legacy_license_unknown_not_flagged(self):
+        # A placeholder UNKNOWN License value isn't a real License field
+        md = self.make_metadata()
+        md._fields['License'] = 'UNKNOWN'
+        missing, warnings = md.check()
+        self.assertEqual(warnings, [])
+
+    def test_old_license_text_unchanged(self):
+        # Free-text License on pre-2.4 metadata follows the original rules:
+        # no SPDX validation is applied to it
+        md = LegacyMetadata()
+        md['Name'] = 'foo'
+        md['Version'] = '1.0'
+        md['License'] = 'This is a long free-form license text, not an SPDX expression'
+        md['Metadata-Version'] = '1.2'
+        missing, warnings = md.check()
+        self.assertEqual(warnings, [])
+        self.assertEqual(md['License'], 'This is a long free-form license text, not an SPDX expression')
+
+    def test_invalid_expression(self):
+        md = self.make_metadata(**{'License-Expression': 'MIT AND'})
+        missing, warnings = md.check()
+        self.assertTrue(any('Invalid License-Expression' in w for w in warnings), warnings)
+
+    def test_unknown_identifier(self):
+        md = self.make_metadata(**{'License-Expression': 'FooBar-1.0 OR MIT'})
+        missing, warnings = md.check()
+        self.assertTrue(any('Unknown license identifier' in w for w in warnings), warnings)
+
+    def test_unknown_identifier_no_catalog(self):
+        # Without a catalog, unknown identifiers can't be diagnosed
+        md = self.make_metadata(**{'License-Expression': 'FooBar-1.0 OR MIT'})
+        md.license_catalog = None
+        missing, warnings = md.check()
+        self.assertEqual(warnings, [])
+
+    def test_license_classifiers_deprecated(self):
+        md = self.make_metadata()
+        md['Classifier'] = ['License :: OSI Approved :: MIT License']
+        missing, warnings = md.check()
+        self.assertTrue(any('License classifiers are deprecated' in w for w in warnings), warnings)
+
+    def test_license_file_parent_directory(self):
+        md = self.make_metadata(**{'License-File': ['../secret.txt']})
+        missing, warnings = md.check()
+        self.assertTrue(any('Invalid License-File' in w and '..' in w for w in warnings), warnings)
+
+    def test_license_file_path_validation(self):
+        bad = ('', '/etc/passwd', 'C:\\license.txt', '..\\secret.txt', 'a//b.txt', 'a/./b/../../c.txt')
+        for value in bad:
+            self.assertIsNotNone(validate_license_file_path(value), value)
+        good = ('LICENSE', 'LICENSES/MIT.txt', 'licenses/vendor/Apache-2.0.txt')
+        for value in good:
+            self.assertIsNone(validate_license_file_path(value), value)
+
+    def test_license_file_order_preserved(self):
+        md = self.make_metadata(**{'License-File': ['b.txt', 'a.txt', 'c.txt']})
+        self.assertEqual(md['License-File'], ['b.txt', 'a.txt', 'c.txt'])
+        buf = StringIO()
+        md.write_file(buf, skip_unknown=True)
+        md2 = LegacyMetadata(fileobj=StringIO(buf.getvalue()))
+        self.assertEqual(md2['License-File'], ['b.txt', 'a.txt', 'c.txt'])
+
+    def test_metadata_wrapper(self):
+        # The Metadata class exposes the fields as structured values, too
+        md = self.make_metadata()
+        buf = StringIO()
+        md.write_file(buf, skip_unknown=True)
+        m = Metadata(fileobj=StringIO(buf.getvalue()))
+        self.assertEqual(m.license_expression, self.EXPRESSION)
+        self.assertEqual(m.license_files, self.LICENSE_FILES)
 
 
 if __name__ == '__main__':  # pragma: no cover

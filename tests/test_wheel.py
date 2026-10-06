@@ -8,6 +8,7 @@ from __future__ import unicode_literals
 
 import io
 import os
+import posixpath
 import re
 import shutil
 import subprocess
@@ -431,6 +432,76 @@ class WheelTestCase(DistlibTestCase):
             key, value = line[:i], line[i + 1:].lstrip()
             actual[key] = value
         self.assertEqual(actual, expected)
+
+    def build_licensed_wheel(self, workdir, license_files, arcnames, expression=None):
+        name, version = 'licensed', '1.0'
+        purelib = os.path.join(workdir, 'purelib')
+        distinfo = os.path.join(purelib, '%s-%s.dist-info' % (name, version))
+        os.makedirs(distinfo)
+        lines = [
+            'Metadata-Version: 2.4',
+            'Name: %s' % name,
+            'Version: %s' % version,
+        ]
+        if expression:
+            lines.append('License-Expression: %s' % expression)
+        for value in license_files:
+            lines.append('License-File: %s' % value)
+        with open(os.path.join(distinfo, 'METADATA'), 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        for arcname in arcnames:
+            p = os.path.join(distinfo, 'licenses', arcname)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, 'w') as f:
+                f.write('license text for %s\n' % arcname)
+        wheel = Wheel('%s-%s' % (name, version))
+        wheel.dirname = workdir
+        pathname = wheel.build({'prefix': workdir, 'purelib': purelib})
+        self.assertTrue(os.path.exists(pathname))
+        return Wheel(pathname)
+
+    def test_license_files(self):
+        # PEP 639: a wheel with a compound License-Expression and two
+        # License-File entries survives a build/read round trip, with the
+        # values kept as structured fields (not folded into any text field)
+        expression = '(MIT OR Apache-2.0) AND BSD-3-Clause WITH LLVM-exception'
+        license_files = ['LICENSES/MIT.txt', 'LICENSES/Apache-2.0.txt']
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        wheel = self.build_licensed_wheel(workdir, license_files, license_files, expression)
+        # the declared license files are all present at the required location
+        self.assertEqual(wheel.check_license_files(), [])
+        metadata = wheel.metadata
+        self.assertEqual(metadata.license_expression, expression)
+        self.assertEqual(metadata.license_files, license_files)
+        # not folded into the legacy License text or the description
+        self.assertNotIn(expression, metadata.license or '')
+        # the files really are in the wheel, in the declared order
+        info_dir = '%s-%s.dist-info' % (wheel.name, wheel.version)
+        with ZipFile(os.path.join(wheel.dirname, wheel.filename), 'r') as zf:
+            names = zf.namelist()
+        for value in license_files:
+            self.assertIn(posixpath.join(info_dir, 'licenses', value), names)
+
+    def test_license_files_missing(self):
+        license_files = ['LICENSES/MIT.txt', 'LICENSES/Apache-2.0.txt']
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        # only one of the two declared files is actually included
+        wheel = self.build_licensed_wheel(workdir, license_files, license_files[:1])
+        problems = wheel.check_license_files()
+        self.assertEqual(len(problems), 1)
+        self.assertIn('LICENSES/Apache-2.0.txt', problems[0])
+        self.assertIn('not found', problems[0])
+
+    def test_license_files_invalid_path(self):
+        workdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, workdir)
+        wheel = self.build_licensed_wheel(workdir, ['../secret.txt'], [])
+        problems = wheel.check_license_files()
+        self.assertEqual(len(problems), 1)
+        self.assertIn('Invalid License-File', problems[0])
+        self.assertIn('..', problems[0])
 
     def test_build_tags(self):
         workdir = tempfile.mkdtemp()
